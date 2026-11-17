@@ -1,22 +1,29 @@
 """
-MARK XL — Screen / Camera Processor
-Replaces Gemini Live vision session with a direct Ollama vision-model call.
-The analysis text is returned (and optionally spoken via the `speak` callback).
+Screen & webcam capture for JARVIS vision.
+
+Provides the two capture entry points main.py uses — `_capture_screen()` and
+`_capture_camera()` — plus their helpers (compression, camera auto-detection,
+config access). main.py grabs a frame here on demand, then injects it into the
+main Gemini Live session; there is no separate vision session here.
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Callable
 
-try:
-    import cv2
-    _CV2 = True
-except ImportError:
-    _CV2 = False
+import numpy as np
+
+from core.lazyimport import LazyModule, installed
+
+# OpenCV is 224 ms and is only ever touched by the webcam path — see
+# core/lazyimport.py. Screen capture, which is what this action does on almost
+# every call, never reaches it. numpy above stays eager: main.py already
+# imports it for audio, so it is in memory before this file is read.
+_CV2 = installed("cv2")
+
+cv2 = LazyModule("cv2")
 
 try:
     import mss
@@ -31,10 +38,6 @@ try:
 except ImportError:
     _PIL = False
 
-import platform
-
-import requests
-
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -44,10 +47,6 @@ def _base_dir() -> Path:
 
 _BASE        = _base_dir()
 _CONFIG_PATH = _BASE / "config" / "api_keys.json"
-
-_IMG_MAX_W = 640
-_IMG_MAX_H = 360
-_JPEG_Q    = 60
 
 
 def _load_config() -> dict:
@@ -63,23 +62,22 @@ def _save_config_key(key: str, value) -> None:
         cfg[key] = value
         _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
     except Exception as e:
-        print(f"[Vision] ⚠️ Could not save config key '{key}': {e}")
+        print(f"[Vision] ⚠️  Could not save config key '{key}': {e}")
 
 
 def _get_os() -> str:
-    s = platform.system().lower()
-    if s == "darwin":  return "mac"
-    if s == "windows": return "windows"
-    return "linux"
+    return _load_config().get("os_system", "windows").lower()
 
 
-# ---------------------------------------------------------------------------
-# Image capture helpers (unchanged from original)
-# ---------------------------------------------------------------------------
+_IMG_MAX_W = 1280
+_IMG_MAX_H = 720
+_JPEG_Q    = 82
+
 
 def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]:
     if not _PIL:
         return img_bytes, f"image/{source_format.lower()}"
+
     try:
         img = PIL.Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img.thumbnail((_IMG_MAX_W, _IMG_MAX_H), PIL.Image.BILINEAR)
@@ -87,22 +85,26 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         img.save(buf, format="JPEG", quality=_JPEG_Q, optimize=False)
         return buf.getvalue(), "image/jpeg"
     except Exception as e:
-        print(f"[Vision] ⚠️ Image compress failed: {e}")
+        print(f"[Vision] ⚠️  Image compress failed: {e}")
         return img_bytes, f"image/{source_format.lower()}"
 
 
 def _capture_screen() -> tuple[bytes, str]:
+
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
+
     with mss.mss() as sct:
-        monitors = sct.monitors
+        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
         target   = monitors[1] if len(monitors) > 1 else monitors[0]
         shot     = sct.grab(target)
         png      = mss.tools.to_png(shot.rgb, shot.size)
+
     return _compress(png, "PNG")
 
 
 def _cv2_backend() -> int:
+    """Return the best OpenCV camera backend for the current OS."""
     if not _CV2:
         return 0
     os_name = _get_os()
@@ -114,12 +116,13 @@ def _cv2_backend() -> int:
 
 
 def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
+
     if not _CV2:
         return False
-    import numpy as np
     cap = cv2.VideoCapture(index, backend)
     if not cap.isOpened():
-        cap.release(); return False
+        cap.release()
+        return False
     for _ in range(warmup):
         cap.read()
     ret, frame = cap.read()
@@ -130,15 +133,17 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
 
 
 def _detect_camera_index() -> int:
+
     backend = _cv2_backend()
-    print("[Vision] 🔍 Auto-detecting camera…")
+    print("[Vision] 🔍 Auto-detecting camera...")
     for idx in range(6):
         if _probe_camera(idx, backend):
             print(f"[Vision] ✅ Camera found at index {idx}")
             _save_config_key("camera_index", idx)
             return idx
-        print(f"[Vision] ⚠️ Camera index {idx}: no usable frame")
-    print("[Vision] ⚠️ No camera found — defaulting to index 0")
+        print(f"[Vision] ⚠️  Camera index {idx}: no usable frame")
+
+    print("[Vision] ⚠️  No camera found — defaulting to index 0")
     _save_config_key("camera_index", 0)
     return 0
 
@@ -153,18 +158,23 @@ def _get_camera_index() -> int:
 def _capture_camera() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
-    import numpy as np
+
     index   = _get_camera_index()
     backend = _cv2_backend()
     cap     = cv2.VideoCapture(index, backend)
+
     if not cap.isOpened():
         raise RuntimeError(f"Camera index {index} could not be opened.")
+
     for _ in range(10):
         cap.read()
+
     ret, frame = cap.read()
     cap.release()
+
     if not ret or frame is None:
         raise RuntimeError("Camera returned no frame.")
+
     if _PIL:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = PIL.Image.fromarray(rgb)
@@ -172,101 +182,6 @@ def _capture_camera() -> tuple[bytes, str]:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=_JPEG_Q)
         return buf.getvalue(), "image/jpeg"
+
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
     return buf.tobytes(), "image/jpeg"
-
-
-# ---------------------------------------------------------------------------
-# Vision analysis via Ollama
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = (
-    "You are JARVIS, an advanced AI assistant. "
-    "Analyze the provided image with precision and intelligence. "
-    "Be concise and direct — maximum two sentences unless the user's question "
-    "requires more detail. "
-    "Address the user respectfully."
-)
-
-
-def _call_vision(image_bytes: bytes, mime: str, user_text: str) -> str:
-    cfg          = _load_config()
-    url          = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
-    vision_model = cfg.get("vision_model") or cfg.get("llm_model", "llava")
-
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-
-    payload = {
-        "model":  vision_model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role":    "user",
-                "content": user_text,
-                "images":  [b64],
-            },
-        ],
-    }
-    try:
-        resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-        resp.raise_for_status()
-        return (resp.json().get("message", {}).get("content") or "").strip()
-    except requests.exceptions.ConnectionError:
-        return "Cannot connect to Ollama. Make sure Ollama is running."
-    except Exception as e:
-        return f"Vision analysis failed: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-def screen_process(
-    parameters:     dict,
-    response=None,
-    player=None,
-    session_memory=None,
-    speak:          Optional[Callable[[str], None]] = None,
-) -> str:
-    """
-    Capture screen or camera, analyse with Ollama vision model.
-
-    Returns the analysis text (str).
-    Optionally speaks via `speak` callback and logs to `player`.
-    """
-    params    = parameters or {}
-    user_text = (params.get("text") or params.get("user_text") or "").strip()
-    angle     = params.get("angle", "screen").lower().strip()
-
-    if not user_text:
-        user_text = "What do you see? Describe briefly."
-
-    if player:
-        player.write_log(f"SYS: Vision [{angle}] — {user_text[:60]}")
-
-    # Capture
-    try:
-        if angle == "camera":
-            image_bytes, mime = _capture_camera()
-            print(f"[Vision] 📷 Camera: {len(image_bytes):,} bytes")
-        else:
-            image_bytes, mime = _capture_screen()
-            print(f"[Vision] 🖥️  Screen: {len(image_bytes):,} bytes")
-    except Exception as e:
-        msg = f"Capture error: {e}"
-        print(f"[Vision] ❌ {msg}")
-        if player: player.write_log(f"ERR: {msg}")
-        return msg
-
-    # Analyse
-    analysis = _call_vision(image_bytes, mime, user_text)
-    print(f"[Vision] 💬 {analysis[:120]}")
-
-    if player:
-        player.write_log(f"Jarvis: {analysis}")
-
-    if speak and analysis:
-        speak(analysis)
-
-    return analysis

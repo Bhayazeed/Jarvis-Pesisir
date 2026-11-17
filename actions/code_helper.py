@@ -12,10 +12,31 @@ def get_base_dir():
     return Path(__file__).resolve().parent.parent
 
 BASE_DIR           = get_base_dir()
+API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
+# Model choice lives in core/gemini.py, and so does the timeout and the
+# fallback ladder. Writing a model name here is what left this file hanging
+# forever whenever that one alias was unwell.
+from core import gemini
 
-from core.llm_client import call_llm_text as _llm
+
+def _get_api_key() -> str:
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
+
+
+def _get_gemini(tier: str = gemini.SMART):
+    """Writing and fixing code is the reasoning tier; a 60s deadline because a
+    whole file can come back."""
+    class _W:
+        def generate_content(self, contents):
+            resp = gemini.call(contents, tier=tier, timeout_ms=60000)
+            if resp is None:
+                raise RuntimeError("every Gemini model on the ladder failed")
+            return resp
+
+    return _W()
 
 
 def _clean_code(text: str) -> str:
@@ -94,68 +115,97 @@ def _image_to_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
 
 
+_VALID_INTENTS = {"write", "edit", "explain", "run", "build", "screen_debug", "optimize"}
+
+
 def _detect_intent(description: str, file_path: str, code: str) -> str:
-    desc = (description or "").lower()
+    """
+    Language-independent intent detection — NO fixed keyword list.
+    Whatever language the user speaks, the description is classified by
+    Gemini. If the API is unreachable, it falls back to language-agnostic
+    structural hints (does the file exist on disk, was code provided).
+    """
+    desc        = (description or "").strip()
+    file_exists = bool(file_path) and Path(file_path).exists()
 
-    screen_kw = ["ekrandaki", "screen", "ekranda", "bu hatayı", "why am i getting",
-                 "neden hata", "what's wrong", "ne yanlış", "screenshot", "görüntü"]
-    if any(k in desc for k in screen_kw):
-        return "screen_debug"
+    if desc:
+        try:
+            ctx = []
+            if file_path:
+                ctx.append(f"a file path is provided (exists on disk: {file_exists})")
+            if code:
+                ctx.append("an inline code snippet is provided")
+            prompt = (
+                "Classify a coding assistant request into exactly ONE intent word.\n"
+                "The request may be written in ANY language.\n\n"
+                f"Request: {desc}\n"
+                + (f"Context: {'; '.join(ctx)}\n" if ctx else "")
+                + "\nIntents:\n"
+                "  write        = create new code from scratch\n"
+                "  edit         = modify an existing file\n"
+                "  explain      = describe what given code/file does\n"
+                "  run          = execute an existing file\n"
+                "  build        = write code, run it, and iterate until it works\n"
+                "  screen_debug = analyze an error currently visible on the user's screen\n"
+                "  optimize     = refactor / clean up / speed up existing code\n\n"
+                "Reply with ONLY the intent word, nothing else."
+            )
+            ans = _get_gemini().generate_content(prompt).text.strip().lower()
+            ans = ans.strip("`'\". \n")
+            if ans in _VALID_INTENTS:
+                return ans
+        except Exception as e:
+            print(f"[Code] Intent classification failed ({e}) — structural fallback")
 
-    optimize_kw = ["optimize", "refactor", "clean up", "improve", "temizle",
-                   "iyileştir", "daha iyi", "make it better", "hızlandır"]
-    if any(k in desc for k in optimize_kw) and (code or file_path):
-        return "optimize"
-
-    if file_path:
-        p = Path(file_path)
-        edit_kw  = ["edit", "update", "modify", "change", "add", "remove",
-                    "refactor", "fix", "rename", "replace", "düzenle", "değiştir"]
-        run_kw   = ["run", "execute", "launch", "start", "çalıştır"]
-        build_kw = ["build", "make it work", "try", "attempt"]
-
-        if p.exists() and any(k in desc for k in edit_kw):
-            return "edit"
-        if p.exists() and any(k in desc for k in run_kw):
-            return "run"
-        if any(k in desc for k in build_kw):
-            return "build"
-        if p.exists():
-            return "explain"
-
-    explain_kw = ["explain", "what does", "describe", "analyze", "açıkla", "ne yapıyor"]
-    if any(k in desc for k in explain_kw) and (code or file_path):
+    # Structural fallback — not tied to any language
+    if file_exists:
+        return "edit" if desc else "explain"
+    if code:
         return "explain"
-
-    build_kw = ["build", "make it work", "try and", "attempt"]
-    if any(k in desc for k in build_kw):
-        return "build"
-
     return "write"
 
 def _write(description: str, language: str, output_path: str, player=None) -> tuple[str, Path]:
-    lang   = language or "python"
-    system = f"You are an expert {lang} developer. Output ONLY raw code, no markdown, no backticks, no explanations."
-    prompt = (
-        f"Write clean, working, well-commented {lang} code.\n"
-        f"Handle errors and edge cases. Use modern best practices.\n\n"
-        f"Description: {description}\n\nCode:"
-    )
-    code = _clean_code(_llm(prompt, system=system))
-    path = _resolve_save_path(output_path, lang)
+    lang  = language or "python"
+    model = _get_gemini()
+
+    prompt = f"""You are an expert {lang} developer.
+Write clean, working, well-commented {lang} code for the description below.
+
+Rules:
+- Output ONLY the code. No explanation, no markdown, no backticks.
+- Add helpful inline comments.
+- Handle errors and edge cases properly.
+- Use modern best practices.
+
+Description: {description}
+
+Code:"""
+
+    response = model.generate_content(prompt)
+    code     = _clean_code(response.text)
+    path     = _resolve_save_path(output_path, lang)
     _save_file(path, code)
     return code, path
 
 
 def _fix_code(code: str, error_output: str, description: str) -> str:
-    system = "You are an expert debugger. Return ONLY the corrected code — no explanation, no markdown, no backticks."
-    prompt = (
-        f"Fix the code below. It failed with this error.\n\n"
-        f"Original goal: {description}\n\n"
-        f"Error:\n{error_output[:2000]}\n\n"
-        f"Broken code:\n{code}\n\nFixed code:"
-    )
-    return _clean_code(_llm(prompt, system=system))
+    model  = _get_gemini()
+    prompt = f"""You are an expert debugger.
+The code below failed with the following error. Fix it.
+Return ONLY the corrected code — no explanation, no markdown, no backticks.
+
+Original goal: {description}
+
+Error:
+{error_output[:2000]}
+
+Broken code:
+{code}
+
+Fixed code:"""
+
+    response = model.generate_content(prompt)
+    return _clean_code(response.text)
 
 
 def _run_file(path: Path, args: list, timeout: int) -> str:
@@ -273,14 +323,21 @@ def _edit_action(file_path, instruction, player) -> str:
     if player:
         player.write_log("[Code] Editing file...")
 
-    system = "You are an expert code editor. Return ONLY the complete updated code — no explanation, no markdown, no backticks."
-    prompt = (
-        f"Apply the following change to the code below.\n\n"
-        f"Change: {instruction}\n\n"
-        f"Original code:\n{content}\n\nUpdated code:"
-    )
+    model  = _get_gemini()
+    prompt = f"""You are an expert code editor.
+Apply the following change to the code below.
+Return ONLY the complete updated code — no explanation, no markdown, no backticks.
+
+Change: {instruction}
+
+Original code:
+{content}
+
+Updated code:"""
+
     try:
-        edited = _clean_code(_llm(prompt, system=system))
+        response = model.generate_content(prompt)
+        edited   = _clean_code(response.text)
     except Exception as e:
         return f"Could not edit code: {e}"
 
@@ -300,13 +357,19 @@ def _explain_action(file_path, code, player) -> str:
     if player:
         player.write_log("[Code] Analyzing code...")
 
-    system = "You are an expert programmer. Explain code concisely in 3-6 sentences."
-    prompt = (
-        f"Explain what this code does — what it does, how it works, important details.\n\n"
-        f"Code:\n{code[:4000]}\n\nExplanation:"
-    )
+    model  = _get_gemini()
+    prompt = f"""Explain what this code does in simple, clear language.
+Focus on: what it does, how it works, and any important details.
+Be concise — 3 to 6 sentences maximum.
+
+Code:
+{code[:4000]}
+
+Explanation:"""
+
     try:
-        return _llm(prompt, system=system)
+        response = model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
         return f"Could not explain code: {e}"
 
@@ -334,15 +397,26 @@ def _optimize_action(file_path, code, language, output_path, player) -> str:
     if player:
         player.write_log("[Code] Optimizing code...")
 
-    lang   = language or "python"
-    system = f"You are an expert {lang} developer. Return ONLY the optimized code — no explanation, no markdown, no backticks."
-    prompt = (
-        f"Optimize this {lang} code for performance, readability, and best practices. "
-        f"Remove dead code and unnecessary complexity.\n\n"
-        f"Original code:\n{code[:6000]}\n\nOptimized code:"
-    )
+    lang  = language or "python"
+    model = _get_gemini()
+
+    prompt = f"""You are an expert {lang} developer and code reviewer.
+Optimize the following code for:
+1. Performance — eliminate unnecessary operations, use efficient data structures
+2. Readability — clear variable names, proper formatting, logical structure
+3. Best practices — modern {lang} patterns, error handling, type hints if applicable
+4. Remove dead code, redundant comments, and unnecessary complexity
+
+Return ONLY the optimized code — no explanation, no markdown, no backticks.
+
+Original code:
+{code[:6000]}
+
+Optimized code:"""
+
     try:
-        optimized = _clean_code(_llm(prompt, system=system))
+        response  = model.generate_content(prompt)
+        optimized = _clean_code(response.text)
     except Exception as e:
         return f"Could not optimize code: {e}"
 
@@ -387,51 +461,40 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        import base64, json as _json, requests as _req
-        from pathlib import Path as _Path
+        from google.genai import types
 
-        cfg          = {}
-        cfg_file     = _Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-        try:
-            cfg = _json.loads(cfg_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        image_bytes  = screenshot_path.read_bytes()
+        image_base64 = _image_to_base64(screenshot_path)
 
-        ollama_url    = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
-        vision_model  = cfg.get("vision_model") or cfg.get("llm_model", "llava")
-
-        image_bytes   = screenshot_path.read_bytes()
-        b64           = base64.b64encode(image_bytes).decode("ascii")
         user_question = description or "What error or problem do you see on the screen? How can it be fixed?"
-        context       = ""
+
+        context = ""
         if file_content:
-            context = f"\n\nRelated file content:\n```\n{file_content[:4000]}\n```"
+            context = f"\n\nAdditionally, here is the related file content:\n```\n{file_content[:4000]}\n```"
 
-        analysis_prompt = (
-            f"You are an expert programmer/debugger analyzing a screenshot.\n\n"
-            f"User question: {user_question}{context}\n\n"
-            f"Identify errors, explain the cause, and provide a fix. "
-            f"If you see code, show the corrected version."
-        )
+        analysis_prompt = f"""You are an expert programmer and debugger analyzing a screenshot.
 
-        resp = _req.post(
-            f"{ollama_url}/api/chat",
-            json={
-                "model":   vision_model,
-                "stream":  False,
-                "messages": [
-                    {
-                        "role":    "user",
-                        "content": analysis_prompt,
-                        "images":  [b64],
-                    }
-                ],
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        analysis = (resp.json().get("message", {}).get("content") or "").strip()
-        print("[Code] ✅ Screen analysis complete")
+User's question: {user_question}{context}
+
+Please:
+1. Identify any errors, exceptions, or problems visible on the screen
+2. Explain what is causing the problem in simple terms
+3. Provide a concrete fix or solution
+4. If there's code visible, show the corrected version
+
+Be specific and actionable. If you see an error message, quote it exactly."""
+
+        contents = [
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            analysis_prompt,
+        ]
+
+        response = gemini.call(contents, tier=gemini.SMART, timeout_ms=45_000)
+        if response is None:
+            return "Sir, I couldn't reach Gemini to analyse that screenshot."
+
+        analysis = (response.text or "").strip()
+        print(f"[Code] ✅ Screen analysis complete")
 
         try:
             screenshot_path.unlink()
@@ -439,6 +502,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             pass
 
         if file_path and file_content:
+
             code_match = re.search(r"```[a-zA-Z]*\n(.*?)```", analysis, re.DOTALL)
             if code_match:
                 fixed_code = code_match.group(1).strip()
@@ -450,6 +514,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
         return analysis
 
     except Exception as e:
+
         try:
             screenshot_path.unlink()
         except Exception:
@@ -518,3 +583,51 @@ def code_helper(
 
     else:
         return f"Unknown action: '{action}'. Use write, edit, explain, run, build, optimize, or screen_debug."
+
+
+# ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
+TOOL = {
+    "name": "code_helper",
+    "description": "Writes, edits, explains, runs, or builds code files.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "action": {
+                "type": "STRING",
+                "description": "write | edit | explain | run | build | auto (default: auto)"
+            },
+            "description": {
+                "type": "STRING",
+                "description": "What the code should do or what change to make"
+            },
+            "language": {
+                "type": "STRING",
+                "description": "Programming language (default: python)"
+            },
+            "output_path": {
+                "type": "STRING",
+                "description": "Where to save the file"
+            },
+            "file_path": {
+                "type": "STRING",
+                "description": "Path to existing file for edit/explain/run/build"
+            },
+            "code": {
+                "type": "STRING",
+                "description": "Raw code string for explain"
+            },
+            "args": {
+                "type": "STRING",
+                "description": "CLI arguments for run/build"
+            },
+            "timeout": {
+                "type": "INTEGER",
+                "description": "Execution timeout in seconds (default: 30)"
+            }
+        },
+        "required": [
+            "action"
+        ]
+    },
+    "handler": code_helper,
+}

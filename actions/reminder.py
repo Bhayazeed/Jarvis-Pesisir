@@ -1,11 +1,17 @@
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from memory.memory_manager import remember
+
+_CNW: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if platform.system() == "Windows" else {}
+)
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -14,13 +20,12 @@ def _base_dir() -> Path:
 
 
 def _get_os() -> str:
-    try:
-        cfg = json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-        return cfg.get("os_system", "windows").lower()
-    except Exception:
-        return "windows"
+    _sys = platform.system()
+    if _sys == "Darwin":
+        return "mac"
+    if _sys == "Linux":
+        return "linux"
+    return "windows"
 
 
 def _scripts_dir() -> Path:
@@ -178,7 +183,7 @@ def _schedule_windows(target_dt: datetime, task_name: str,
 
     result = subprocess.run(
         ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", **_CNW,
     )
 
     try:
@@ -233,7 +238,7 @@ def _schedule_mac(target_dt: datetime, task_name: str,
 
     result = subprocess.run(
         ["launchctl", "load", str(plist_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
 
     if result.returncode != 0:
@@ -259,7 +264,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
                 "--",
                 sys.executable, str(script_path),
             ],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return task_name
@@ -270,7 +275,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
         cmd_str = f"{sys.executable} {script_path}\n"
         result  = subprocess.run(
             ["at", at_time],
-            input=cmd_str, capture_output=True, text=True,
+            input=cmd_str, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return task_name
@@ -306,10 +311,18 @@ def reminder(
     safe_msg   = _sanitise(message)
     task_name  = f"JARVISReminder_{target_dt.strftime('%Y%m%d_%H%M%S')}"
 
+    # The phone copy is made first and independently: if this machine's
+    # scheduler fails, the reminder still reaches the phone, and the other way
+    # round. Nothing happens here unless the cloud agent is paired.
+    phone = _mirror_to_cloud(message, target_dt)
+    # The assistant also says it aloud at that moment when it is running — a
+    # routine (core/routines), independent of the system notification below.
+    phone += _add_spoken_routine(message, target_dt)
+
     try:
         script_path = _write_notify_script(task_name, safe_msg, os_name)
     except Exception as e:
-        return f"Could not prepare the reminder script: {e}"
+        return f"Could not prepare the reminder script: {e}{phone}"
 
     try:
         if os_name == "windows":
@@ -321,15 +334,16 @@ def reminder(
     except Exception as e:
         script_path.unlink(missing_ok=True)
         print(f"[Reminder] ❌ Scheduling exception: {e}")
-        return "Something went wrong while scheduling the reminder."
+        return f"Something went wrong while scheduling the reminder.{phone}"
 
     if not job_id:
-        return "I couldn't register the reminder with the system scheduler."
+        return f"I couldn't register the reminder with the system scheduler.{phone}"
 
     if player:
         player.write_log(f"[Reminder] ✅ {date_str} {time_str} — {safe_msg[:40]}")
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
+<<<<<<< HEAD
     
     # Save to long term memory
     try:
@@ -338,3 +352,75 @@ def reminder(
         print(f"[Reminder] ⚠️ Could not save to memory: {e}")
 
     return f"Reminder set for {friendly_time}."
+=======
+    return f"Reminder set for {friendly_time}.{phone}"
+
+
+def _add_spoken_routine(message: str, target_dt: datetime) -> str:
+    try:
+        from core.routines import desktop
+        eng = desktop.engine()
+        if eng is None:
+            return ""
+        eng.add(name=message[:60] or "Reminder", kind="say", text=message,
+                trigger={"type": "time", "rule": {"type": "once", "at_ts": target_dt.timestamp()}},
+                source="reminder")
+        return " It will also be said aloud at that time while the assistant is running."
+    except Exception as e:
+        print(f"[Reminder] spoken copy not set: {e}")
+        return ""
+
+
+def _mirror_to_cloud(message: str, target_dt: datetime) -> str:
+    """Also schedule the reminder on the cloud body, so it reaches the phone
+    over Telegram even if this computer is off at that time.
+
+    Deterministic on purpose: which of two reminder tools a model happens to
+    pick must not decide whether the phone hears about it. Returns a sentence
+    to append to the result, or "" when no cloud is paired — in which case this
+    costs one config read and changes nothing."""
+    try:
+        from memory.config_manager import get_plugin_config, get_plugin_enabled
+        if not (str(get_plugin_config("cloud_agent").get("pair_code") or "").strip()
+                and get_plugin_enabled("cloud_agent")):
+            return ""
+        agent = sys.modules.get("plugins.cloud_agent")
+        if agent is None or not hasattr(agent, "mirror_reminder"):
+            return ""
+        ok, detail = agent.mirror_reminder(message, target_dt.strftime("%Y-%m-%d %H:%M"))
+    except Exception as e:
+        ok, detail = False, str(e)
+    if ok:
+        return " It will also be sent to the user's phone over Telegram at that time."
+    return f" The phone copy could not be set ({detail}) — only this computer will remind them."
+
+
+# ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
+TOOL = {
+    "name": "reminder",
+    "description": "Sets a timed reminder using Task Scheduler.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "date": {
+                "type": "STRING",
+                "description": "Date in YYYY-MM-DD format"
+            },
+            "time": {
+                "type": "STRING",
+                "description": "Time in HH:MM format (24h)"
+            },
+            "message": {
+                "type": "STRING",
+                "description": "Reminder message text"
+            }
+        },
+        "required": [
+            "date",
+            "time",
+            "message"
+        ]
+    },
+    "handler": reminder,
+}
+>>>>>>> 752ff618a4e6a4bf2e675866b993071d739cfce2
