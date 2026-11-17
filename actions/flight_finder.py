@@ -18,22 +18,19 @@ BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
 _MONTH_MAP: dict[str, int] = {
 
     "january": 1, "february": 2, "march": 3,     "april": 4,
     "may": 5,     "june": 6,     "july": 7,       "august": 8,
     "september": 9, "october": 10, "november": 11, "december": 12,
+    "ocak": 1,  "şubat": 2,  "mart": 3,   "nisan": 4,
+    "mayıs": 5, "haziran": 6, "temmuz": 7, "ağustos": 8,
+    "eylül": 9, "ekim": 10,  "kasım": 11, "aralık": 12,
 }
 
-# English fast-path only — Gemini (below) normalizes date expressions in ANY
-# language to YYYY-MM-DD, so no other language needs to be hardcoded here.
 _RELATIVE_MAP_KEYS = {
-    "today",
-    "tomorrow",
+    "today", "bugün",
+    "tomorrow", "yarın",
 }
 
 
@@ -52,25 +49,25 @@ def _parse_date(raw: str) -> str:
             pass
 
     relative = {
-        "today": today,
+        "today": today, "bugün": today,
         "tomorrow": today + timedelta(days=1),
+        "yarın":    today + timedelta(days=1),
     }
     for key, val in relative.items():
         if key in lower:
             return val.strftime("%Y-%m-%d")
 
     try:
-        from core import gemini
-        result = gemini.text(
+        from core.llm_client import call_llm_text
+        result = call_llm_text(
             f"Today is {today.strftime('%Y-%m-%d')}. "
             f"Convert this date expression to YYYY-MM-DD: '{raw}'. "
-            f"Return ONLY the date string, nothing else.",
-            tier=gemini.FAST,
-        )
+            f"Return ONLY the date string, nothing else."
+        ).strip()
         if re.match(r"\d{4}-\d{2}-\d{2}", result):
             return result
     except Exception as e:
-        print(f"[FlightFinder] ⚠️ Gemini date parse failed: {e}")
+        print(f"[FlightFinder] ⚠️ LLM date parse failed: {e}")
 
     for month_name, month_num in _MONTH_MAP.items():
         if month_name in lower:
@@ -148,37 +145,28 @@ def _parse_flights_with_gemini(
     destination: str,
     date:        str,
 ) -> list[dict]:
-    from google import genai as _genai
-    from google.genai import types
+    from core.llm_client import call_llm_text
 
-    prompt  = (
+    system = (
+        "You are a flight data extraction expert. "
+        "Extract flight information from raw webpage text. "
+        "Return ONLY valid JSON — no markdown, no explanation."
+    )
+    prompt = (
         f"Extract flight options from {origin} to {destination} on {date} "
-        f"from this Google Flights page text:\n\n{raw_text[:12000]}\n\n"
+        f"from this Google Flights page text:\n\n{raw_text[:8000]}\n\n"
         f"Return a JSON array of up to 5 flights:\n"
         f'[{{"airline":"...","departure":"HH:MM","arrival":"HH:MM",'
         f'"duration":"Xh Ym","stops":0,"price":"...","currency":"USD"}}]\n'
         f"If no flights found, return: []"
     )
-
     try:
-        from core import gemini
-        response = gemini.call(
-            prompt,
-            tier=gemini.SMART,
-            timeout_ms=30_000,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are a flight data extraction expert. "
-                    "Extract flight information from raw webpage text. "
-                    "Return ONLY valid JSON — no markdown, no explanation."
-                )
-            ),
-        )
-        text     = re.sub(r"```(?:json)?", "", response.text).strip().rstrip("`").strip()
-        flights  = json.loads(text)
+        text    = call_llm_text(prompt, system=system)
+        text    = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+        flights = json.loads(text)
         return flights if isinstance(flights, list) else []
     except Exception as e:
-        print(f"[FlightFinder] ⚠️ Gemini parse failed: {e}")
+        print(f"[FlightFinder] ⚠️ LLM parse failed: {e}")
         return []
 
 def _format_spoken(
@@ -357,49 +345,3 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
     except Exception as e:
         print(f"[FlightFinder] ❌ {e}")
         return f"Flight search failed, sir: {e}"
-
-
-# ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
-TOOL = {
-    "name": "flight_finder",
-    "description": "Searches Google Flights and speaks the best options.",
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "origin": {
-                "type": "STRING",
-                "description": "Departure city or airport code"
-            },
-            "destination": {
-                "type": "STRING",
-                "description": "Arrival city or airport code"
-            },
-            "date": {
-                "type": "STRING",
-                "description": "Departure date (any format)"
-            },
-            "return_date": {
-                "type": "STRING",
-                "description": "Return date for round trips"
-            },
-            "passengers": {
-                "type": "INTEGER",
-                "description": "Number of passengers (default: 1)"
-            },
-            "cabin": {
-                "type": "STRING",
-                "description": "economy | premium | business | first"
-            },
-            "save": {
-                "type": "BOOLEAN",
-                "description": "Save results to Notepad"
-            }
-        },
-        "required": [
-            "origin",
-            "destination",
-            "date"
-        ]
-    },
-    "handler": flight_finder,
-}
