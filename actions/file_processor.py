@@ -42,7 +42,7 @@ def _gemini_client():
 
 def _detect_type(path: Path) -> str:
     ext = path.suffix.lower().lstrip(".")
-    image_exts = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico"}
+    image_exts = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "jfif"}
     video_exts = {"mp4", "avi", "mov", "mkv", "wmv", "flv", "webm", "m4v", "3gp"}
     audio_exts = {"mp3", "wav", "ogg", "m4a", "aac", "flac", "wma", "opus"}
     code_exts  = {"py", "js", "ts", "jsx", "tsx", "html", "css", "java", "c",
@@ -508,10 +508,10 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
     except Exception as e:
         return f"AI processing failed: {e}"
 
-def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
+def _process_audio(path: Path, action: str, params: dict, speak=None, stt=None) -> str:
     action = action or "transcribe"
 
-    if action == "info":
+    if action in ("info", "list"):
         try:
             from pydub import AudioSegment
             audio    = AudioSegment.from_file(path)
@@ -527,6 +527,18 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
             return f"Info failed: {e}"
 
     if action == "transcribe":
+        if stt is not None:
+            try:
+                import librosa
+                audio, _ = librosa.load(str(path), sr=16000, mono=True)
+                result = stt.transcribe(audio)
+                if params.get("save", True):
+                    out = _output_path(path, "transcript", ".txt")
+                    out.write_text(result, encoding="utf-8")
+                    return f"Transcription saved: {out.name}\n\nPreview: {result[:300]}"
+                return result
+            except Exception as e:
+                print(f"[FileProcessor] Remote/Local STT engine failed, falling back to Gemini: {e}")
         try:
             model   = _gemini_client()
             content = path.read_bytes()
@@ -579,7 +591,7 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown audio action: '{action}'. Try: transcribe, info, convert, trim"
 
-def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
+def _process_video(path: Path, action: str, params: dict, speak=None, stt=None) -> str:
     action = action or "info"
 
 
@@ -684,7 +696,7 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
                  str(tmp_audio), "-y"],
                 capture_output=True, timeout=300
             )
-            result = _process_audio(tmp_audio, "transcribe", params, speak)
+            result = _process_audio(tmp_audio, "transcribe", params, speak, stt)
             return result
         except Exception as e:
             return f"Video transcription failed: {e}"
@@ -774,7 +786,7 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
-def file_processor(parameters: dict, player=None, speak=None) -> str:
+def file_processor(parameters: dict, player=None, speak=None, stt=None) -> str:
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
         return "No file path provided."
@@ -815,8 +827,8 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
         "json":    _process_json,
         "xml":     lambda p, a, pm, s: _process_json(p, a, pm, s),  
         "code":    _process_code,
-        "audio":   _process_audio,
-        "video":   _process_video,
+        "audio":   lambda p, a, pm, s: _process_audio(p, a, pm, s, stt),
+        "video":   lambda p, a, pm, s: _process_video(p, a, pm, s, stt),
         "archive": _process_archive,
         "pptx":    _process_pptx,
     }

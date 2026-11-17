@@ -31,6 +31,25 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     return results
 
 
+def _scrape_url(url: str, max_chars: int = 4000) -> str:
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for element in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+            element.extract()
+        text = soup.get_text(separator=" ", strip=True)
+        # Collapse multiple spaces
+        import re
+        text = re.sub(r'\s+', ' ', text)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
         return f"No results found for: {query}"
@@ -48,7 +67,8 @@ def _llm_summarize(query: str, raw_results: str) -> str:
         from core.llm_client import call_llm_text
         system = (
             "You are JARVIS. Summarize web search results clearly and concisely. "
-            "Answer the user's query directly. Be factual. Address user as 'sir'."
+            "Answer the user's query directly. Be factual. Address user as 'sir'. "
+            "If the query or context implies Malay/Indonesian, summarize in fluent Malay/Indonesian."
         )
         prompt = (
             f"User question: {query}\n\n"
@@ -107,6 +127,12 @@ def web_search(
             return _compare(items, aspect)
 
         results = _ddg_search(query)
+        if results and results[0].get("url"):
+            print(f"[WebSearch] 🌐 Scraping top result: {results[0]['url']}")
+            page_text = _scrape_url(results[0]["url"])
+            if page_text:
+                results[0]["snippet"] = f"[FULL PAGE CONTENT]\n{page_text}"
+
         raw     = _format_ddg(query, results)
         print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
         # Let Ollama summarise the results for a cleaner spoken response

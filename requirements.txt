@@ -13,6 +13,7 @@ psutil
 pillow
 sounddevice
 numpy
+scipy
 soundfile
 requests
 
@@ -39,10 +40,22 @@ win10toast; sys_platform == "win32"
 youtube-transcript-api
 python-pptx
 miniaudio
+librosa
+imageio-ffmpeg
 
 # ── STT — choose one (auto-installed by main.py based on your config) ─────
 faster-whisper        # Whisper  (default, recommended)
 # vosk               # Vosk     (alternative — uncomment if preferred)
+
+# ── Wav2Vec 2.0 STT (private HF model — requires HF_TOKEN in .env) ────────
+torch
+torchaudio
+transformers
+huggingface-hub
+safetensors
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+python-dotenv
 
 # ── TTS — choose one (auto-installed by main.py based on your config) ─────
 edge-tts              # EdgeTTS  (default, free, requires internet)
@@ -52,3 +65,7 @@ edge-tts              # EdgeTTS  (default, free, requires internet)
 # ── Local LLM ─────────────────────────────────────────────────────────────
 # Ollama must be installed separately: https://ollama.com
 # Then pull a model:  ollama pull qwen2.5:7b
+openai
+pynput
+beautifulsoup4
+pynput

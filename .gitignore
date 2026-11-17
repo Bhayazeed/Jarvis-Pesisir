@@ -1,0 +1,36 @@
+# ── Environment & Secrets ──────────────────────────────────────────────────
+.env
+config/api_keys.json
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# ── Virtual Environment ───────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+
+# ── IDE ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Models (large binary weights — download at runtime) ───────────────────
+models/
+!models/.gitkeep
+
+# ── Memory (personal user data) ───────────────────────────────────────────
+memory/long_term.json
+
+# ── OS junk ────────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store

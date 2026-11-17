@@ -98,6 +98,113 @@ def _play_audio_bytes(audio_bytes: bytes) -> None:
     sd.wait()
 
 
+def load_audio_file(path: str, target_sr: int = 16_000) -> np.ndarray:
+    """Load an audio file and return float32 mono at target_sr Hz.
+
+    Decoder priority (tries each, moves to next on failure):
+      1. librosa    — best coverage: WAV/MP3/OGG/FLAC/M4A/AAC (via soundfile+ffmpeg)
+      2. soundfile  — WAV/MP3/OGG/FLAC (no ffmpeg needed)
+      3. miniaudio  — WAV/MP3/OGG/FLAC natively
+      4. pydub      — M4A/AAC/WebM/WMA (requires ffmpeg on PATH)
+      5. scipy      — plain WAV fallback
+    """
+    # ── Inject imageio-ffmpeg path dynamically ───────────────────────────
+    try:
+        import os
+        import imageio_ffmpeg
+        ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+        if ffmpeg_dir and ffmpeg_dir not in os.environ["PATH"]:
+            os.environ["PATH"] += os.path.pathsep + ffmpeg_dir
+    except Exception:
+        pass
+    # ─────────────────────────────────────────────────────────────────────
+
+    errors: list[str] = []
+
+    # ── 1. librosa (best coverage + proper resampling) ────────────────────
+    try:
+        import librosa
+        audio, _ = librosa.load(path, sr=target_sr, mono=True)
+        if audio.size > 0:
+            return audio.astype(np.float32)
+    except ImportError:
+        errors.append("librosa: not installed")
+    except Exception as e:
+        errors.append(f"librosa: {e}")
+
+    # ── 2. soundfile (already installed) ──────────────────────────────────
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        audio = data.mean(axis=1) if data.ndim > 1 and data.shape[1] > 1 else data.flatten()
+        if sr != target_sr:
+            duration = len(audio) / sr
+            n_out = int(duration * target_sr)
+            if n_out > 0:
+                indices = np.linspace(0, len(audio) - 1, n_out).astype(int)
+                audio = audio[indices]
+        if audio.size > 0:
+            return audio.astype(np.float32)
+    except Exception as e:
+        errors.append(f"soundfile: {e}")
+
+    # ── 3. miniaudio (WAV/MP3/OGG/FLAC without ffmpeg) ───────────────────
+    try:
+        import miniaudio
+        decoded = miniaudio.decode_file(
+            path,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=target_sr,
+        )
+        audio = np.array(decoded.samples, dtype=np.float32)
+        if audio.size > 0:
+            return audio
+    except Exception as e:
+        errors.append(f"miniaudio: {e}")
+
+    # ── 4. pydub + ffmpeg (M4A / AAC / WebM / WMA) ───────────────────────
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(path)
+        seg = seg.set_channels(1).set_frame_rate(target_sr).set_sample_width(2)
+        samples = np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
+        if samples.size > 0:
+            return samples
+    except Exception as e:
+        errors.append(f"pydub: {e}")
+
+    # ── 5. scipy fallback (plain WAV only) ────────────────────────────────
+    if path.lower().endswith(".wav"):
+        try:
+            from scipy.io import wavfile
+            sr, data = wavfile.read(path)
+            if data.dtype == np.int16:
+                data = data.astype(np.float32) / 32768.0
+            elif data.dtype == np.int32:
+                data = data.astype(np.float32) / 2147483648.0
+            elif data.dtype != np.float32:
+                data = data.astype(np.float32)
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            if sr != target_sr:
+                duration = len(data) / sr
+                n_out = int(duration * target_sr)
+                indices = np.linspace(0, len(data) - 1, n_out).astype(int)
+                data = data[indices]
+            if data.size > 0:
+                return data
+        except Exception as e:
+            errors.append(f"scipy: {e}")
+
+    _err_detail = " | ".join(errors)
+    raise RuntimeError(
+        f"Cannot decode audio file: {path}\n"
+        f"Tried: {_err_detail}\n"
+        f"Supported formats: WAV, MP3, OGG, FLAC, M4A (M4A requires ffmpeg on PATH)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Engines
 # ---------------------------------------------------------------------------

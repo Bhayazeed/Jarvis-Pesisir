@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from memory.memory_manager import remember
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -329,4 +330,11 @@ def reminder(
         player.write_log(f"[Reminder] ✅ {date_str} {time_str} — {safe_msg[:40]}")
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
+    
+    # Save to long term memory
+    try:
+        remember(f"Reminder on {date_str} {time_str}", safe_msg, category="notes")
+    except Exception as e:
+        print(f"[Reminder] ⚠️ Could not save to memory: {e}")
+
     return f"Reminder set for {friendly_time}."

@@ -1,6 +1,6 @@
 """
 MARK XL — Local LLM Edition
-STT (Whisper / Vosk)  +  Ollama LLM  +  TTS (EdgeTTS / Kokoro / ElevenLabs)
+STT (Whisper / Vosk / Wav2Vec)  +  Ollama LLM  +  TTS (EdgeTTS / Kokoro / ElevenLabs)
 All Gemini / Google-AI dependencies removed.
 """
 # ── Silence verbose logs + block heavy unused backends ─────────────────────
@@ -27,6 +27,14 @@ _warnings.filterwarnings("ignore", category=DeprecationWarning)
 _warnings.filterwarnings("ignore", category=FutureWarning)
 # ───────────────────────────────────────────────────────────────────────────
 
+# ── Load .env secrets (HF_TOKEN etc.) ──────────────────────────────────────
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass  # python-dotenv not yet installed — will be installed by installer.py
+# ───────────────────────────────────────────────────────────────────────────
+
 # ── Bootstrap: auto-install base UI packages before anything else ──────────
 # Uses only stdlib so it works even on a completely fresh Python install.
 import importlib.util as _ilu
@@ -36,7 +44,7 @@ import sys             as _sys
 _BASE_PKGS = [
     ("PyQt6",       "PyQt6"),
     ("psutil",      "psutil"),
-    ("numpy",       "numpy"),
+    ("numpy",       "numpy<2"),
     ("sounddevice", "sounddevice"),
     ("PIL",         "pillow"),
     ("requests",    "requests"),
@@ -196,7 +204,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "play | summarize | get_info | trending"},
+                "action": {"type": "STRING", "enum": ["play", "summarize", "get_info", "trending"], "description": "Action to perform"},
                 "query":  {"type": "STRING", "description": "Search query for play action"},
                 "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad"},
                 "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
@@ -532,8 +540,14 @@ def _to_ollama_tools(decls: list) -> list:
         })
     return tools
 
+# Mematikan (disable) tools berat untuk meringankan beban LLM SI-Lab
+_ACTIVE_TOOLS = ["web_search", "file_processor", "youtube_video", "browser_control", "reminder"]
+_FILTERED_TOOLS = [t for t in TOOL_DECLARATIONS if t["name"] in _ACTIVE_TOOLS]
 
-OLLAMA_TOOLS = _to_ollama_tools(TOOL_DECLARATIONS)
+# Semua tools diaktifkan sesuai permintaan
+# OLLAMA_TOOLS = _to_ollama_tools(TOOL_DECLARATIONS)
+
+OLLAMA_TOOLS = _to_ollama_tools(_FILTERED_TOOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -569,10 +583,10 @@ class _VADBuffer:
     def __init__(
         self,
         sample_rate:    int   = 16_000,
-        silence_sec:    float = 0.7,    # silence after last word → send to STT
-        speech_thresh:  float = 0.008,  # RMS above this = speech  (0.008 catches voice at 3-4 m; raise if mic picks up too much room noise)
-        silence_thresh: float = 0.004,  # RMS below this = silence (half of speech_thresh — hysteresis prevents mid-sentence cuts)
-        min_speech_sec: float = 0.3,
+        silence_sec:    float = 0.8,    # Reduced to make it snappier (was 1.0)
+        speech_thresh:  float = 0.015,  # Increased to ignore room noise (was 0.008)
+        silence_thresh: float = 0.010,  # Increased to actually detect silence in noisy rooms (was 0.003)
+        min_speech_sec: float = 0.4,
         max_speech_sec: float = 30.0,
     ):
         self._sr            = sample_rate
@@ -584,6 +598,23 @@ class _VADBuffer:
         self._buf:          list[np.ndarray] = []
         self._in_spch       = False
         self._sil_cnt       = 0
+
+    def reset(self):
+        """Clear all buffered audio and state — call on unmute."""
+        self._buf      = []
+        self._in_spch  = False
+        self._sil_cnt  = 0
+
+    def flush(self) -> np.ndarray | None:
+        """Force return of buffered audio immediately (e.g. on PTT release)."""
+        if self._in_spch and self._buf:
+            audio = np.concatenate(self._buf)
+            self.reset()
+            if len(audio) >= self._min_n:
+                return audio
+        self.reset()
+        return None
+
     def process(self, chunk: np.ndarray) -> np.ndarray | None:
         """
         Feed one audio chunk (float32 mono).
@@ -618,6 +649,13 @@ class _VADBuffer:
 
 
 # ---------------------------------------------------------------------------
+# Audio file loading helper (for demo mode)
+# ---------------------------------------------------------------------------
+from core.tts import load_audio_file
+
+
+
+# ---------------------------------------------------------------------------
 # JarvisLocal
 # ---------------------------------------------------------------------------
 
@@ -625,7 +663,7 @@ class JarvisLocal:
     """
     Main assistant class.
     Replaces JarvisLive (Gemini Live API) with:
-      STT (Whisper/Vosk) → Ollama LLM (tool calling) → TTS (Edge/Kokoro/ElevenLabs)
+      STT (Whisper/Vosk/Wav2Vec) → Ollama LLM (tool calling) → TTS (Edge/Kokoro/ElevenLabs)
     """
 
     def __init__(self, ui: JarvisUI):
@@ -639,8 +677,12 @@ class JarvisLocal:
         self._text_queue:     queue.Queue = queue.Queue()
         self._tts_queue:      queue.Queue = queue.Queue()
         self._conversation:   list[dict]  = []
+        self._vad:            _VADBuffer | None = None   # set once listen loop starts
+        self._mic_queue:      queue.Queue | None = None  # shared with mic callback
+        self._llm_generating  = False
 
         self.ui.on_text_command = self._on_text_command
+        self.ui.on_demo_audio   = self._process_demo_audio
 
     # ------------------------------------------------------------------
     # System prompt
@@ -695,10 +737,12 @@ class JarvisLocal:
                 print(f"[TTS] speak error: {e}")
             finally:
                 self._tts_queue.task_done()
-                if self._tts_queue.empty():
+                if self._tts_queue.empty() and not self._llm_generating:
                     with self._speaking_lock:
                         self._speaking = False
-                    if not self.ui.muted:
+                    if self.ui.muted:
+                        self.ui.set_state("MUTED")
+                    else:
                         self.ui.set_state("LISTENING")
 
     def set_speaking(self, value: bool) -> None:
@@ -706,7 +750,9 @@ class JarvisLocal:
             self._speaking = value
         if value:
             self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
+        elif self.ui.muted:
+            self.ui.set_state("MUTED")
+        else:
             self.ui.set_state("LISTENING")
 
     def speak(self, text: str) -> None:
@@ -719,7 +765,7 @@ class JarvisLocal:
     def speak_error(self, tool_name: str, error) -> None:
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"{tool_name} encountered an error.")
+        self.speak(f"{tool_name} mengalami masalah.")
 
     # ------------------------------------------------------------------
     # Live reconfigure (called when user clicks Apply in Configure panel)
@@ -760,6 +806,18 @@ class JarvisLocal:
                 if new_stt_engine == "vosk":
                     from core.stt import VoskSTT
                     self._stt = VoskSTT(new_config.get("vosk_model_path"), language=stt_language)
+                elif new_stt_engine == "wav2vec":
+                    import os
+                    from core.stt import Wav2Vec2STT
+                    self._stt = Wav2Vec2STT(
+                        model_path=new_config.get("stt_model", "Ziidsbox/wav2vec2-indonesian-melayu-riau"),
+                        hf_token=os.getenv("HF_TOKEN"),
+                    )
+                elif new_stt_engine == "remote":
+                    from core.stt import RemoteSTT
+                    self._stt = RemoteSTT(
+                        api_url=new_config.get("stt_url", "http://localhost:8000/transcribe")
+                    )
                 else:
                     from core.stt import WhisperSTT
                     self._stt = WhisperSTT(new_config.get("stt_model", "base"), language=stt_language)
@@ -777,9 +835,9 @@ class JarvisLocal:
             self.ui.write_log("SYS: New LLM model ready.")
 
         if old_stt_engine == new_stt_engine:
-            self.speak("Configuration applied.")
+            self.speak("Konfigurasi berhasil diterapkan.")
         else:
-            self.speak("LLM and TTS updated. Restart for speech engine change.")
+            self.speak("LLM dan TTS diperbarui. Harap muat ulang untuk perubahan engine suara.")
 
     # ------------------------------------------------------------------
     # Text command (from UI input box)
@@ -787,6 +845,54 @@ class JarvisLocal:
 
     def _on_text_command(self, text: str) -> None:
         self._text_queue.put(text)
+
+    # ------------------------------------------------------------------
+    # Demo audio processing (pre-recorded voice file → STT → LLM)
+    # ------------------------------------------------------------------
+
+    def _process_demo_audio(self, file_path: str) -> None:
+        """Load an audio file, transcribe via STT, and feed to the LLM.
+
+        Called from a background thread (via UI signal).
+        """
+        from pathlib import Path
+        p = Path(file_path)
+        self.ui.write_log(f"DEMO: Loading {p.name}…")
+        self.ui.set_state("PROCESSING")
+
+        try:
+            # 1. Load and decode audio
+            audio = load_audio_file(file_path)
+            duration = len(audio) / 16_000
+            self.ui.write_log(f"DEMO: Audio loaded ({duration:.1f}s)")
+
+            # 2. Transcribe with STT
+            if self._stt is None:
+                raise RuntimeError("STT engine not loaded — cannot transcribe demo audio.")
+
+            self.ui.set_state("THINKING")
+            self.ui.write_log("DEMO: Transcribing…")
+            text = self._stt.transcribe(audio)
+
+            if not text or not text.strip():
+                self.ui.write_log("DEMO: No speech detected in audio.")
+                self.ui.set_demo_status(f"⚠  No speech detected in {p.name}")
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                return
+
+            # 3. Log the transcription and process through LLM
+            self.ui.write_log(f"DEMO: Transcribed → \"{text}\"")
+            self.ui.set_demo_status(f"✓  Transcribed: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+            self._process_message(text)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.ui.write_log(f"ERR: Demo audio — {e}")
+            self.ui.set_demo_status(f"✗  Error: {str(e)[:60]}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
 
     # ------------------------------------------------------------------
     # Tool execution (routing unchanged from original)
@@ -881,7 +987,7 @@ class JarvisLocal:
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
-                r = file_processor(parameters=args, player=self.ui, speak=self.speak)
+                r = file_processor(parameters=args, player=self.ui, speak=self.speak, stt=self._stt)
                 result = r or "Done."
 
             elif name == "computer_control":
@@ -901,7 +1007,7 @@ class JarvisLocal:
 
                 def _shutdown():
                     import time, os
-                    self.speak("Goodbye.")
+                    self.speak("Selamat tinggal.")
                     time.sleep(2.5)
                     os._exit(0)
 
@@ -927,6 +1033,25 @@ class JarvisLocal:
     # ------------------------------------------------------------------
 
     def _process_message(self, user_text: str) -> None:
+        self._llm_generating = True
+        with self._speaking_lock:
+            self._speaking = True
+        try:
+            self._do_process_message(user_text)
+        finally:
+            self._llm_generating = False
+            # Always check & reset _speaking when LLM processing ends.
+            # The TTS worker may have already finished while _llm_generating
+            # was still True, so it would have skipped its own reset.
+            if self._tts_queue.empty():
+                with self._speaking_lock:
+                    self._speaking = False
+                if self.ui.muted:
+                    self.ui.set_state("MUTED")
+                else:
+                    self.ui.set_state("LISTENING")
+
+    def _do_process_message(self, user_text: str) -> None:
         """
         Full turn: user_text → LLM stream → TTS (overlapped) → tool execution
 
@@ -1094,17 +1219,30 @@ class JarvisLocal:
                 self.speak(_reply)
                 break
 
-        if not self.ui.muted:
-            self.ui.set_state("LISTENING")
+
 
     # ------------------------------------------------------------------
     # STT listening loops
     # ------------------------------------------------------------------
 
+    def _on_unmute(self) -> None:
+        """Reset VAD + drain mic queue so stale audio doesn't pollute the next utterance."""
+        if self._vad is not None:
+            self._vad.reset()
+        if self._mic_queue is not None:
+            while not self._mic_queue.empty():
+                try:
+                    self._mic_queue.get_nowait()
+                except queue.Empty:
+                    break
+
     def _listen_whisper(self) -> None:
         """Mic → VAD → Whisper → LLM loop."""
         vad = _VADBuffer()
+        self._vad = vad
         q: queue.Queue = queue.Queue(maxsize=200)
+        self._mic_queue = q
+        _was_muted = False
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
@@ -1123,16 +1261,40 @@ class JarvisLocal:
                 blocksize=BLOCK_SIZE,
                 callback=callback,
             ):
-                self.ui.write_log("SYS: Mic active (Whisper STT).")
+                self.ui.write_log(f"SYS: Mic active ({getattr(self, '_stt_engine_name', 'STT')}).")
                 while True:
+                    # Detect mute→unmute transition and reset state
+                    is_muted = self.ui.muted
+                    if _was_muted and not is_muted:
+                        self._on_unmute()
+                        vad.reset()
+                    elif not _was_muted and is_muted:
+                        # Just muted (e.g. PTT released). Flush immediately.
+                        audio = vad.flush()
+                        if audio is not None:
+                            self.ui.set_state("THINKING")
+                            text = self._stt.transcribe(audio)
+                            if text.strip():
+                                self._process_message(text)
+                            else:
+                                self.ui.set_state("MUTED")
+                    _was_muted = is_muted
+
                     try:
                         chunk = q.get(timeout=0.1)
+                        with self._speaking_lock:
+                            if self._speaking:
+                                vad.reset()
+                                continue
+
                         audio = vad.process(chunk.flatten())
                         if audio is not None:
                             self.ui.set_state("THINKING")
                             text = self._stt.transcribe(audio)
                             if text.strip():
                                 self._process_message(text)
+                            else:
+                                self.ui.set_state("LISTENING")
                     except queue.Empty:
                         pass
         except Exception as e:
@@ -1147,6 +1309,8 @@ class JarvisLocal:
     def _listen_vosk(self) -> None:
         """Mic → Vosk streaming → LLM loop."""
         q: queue.Queue = queue.Queue(maxsize=200)
+        self._mic_queue = q
+        _was_muted = False
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
@@ -1167,11 +1331,24 @@ class JarvisLocal:
             ):
                 self.ui.write_log("SYS: Mic active (Vosk STT).")
                 while True:
+                    # Detect mute→unmute transition and reset state
+                    is_muted = self.ui.muted
+                    if _was_muted and not is_muted:
+                        self._on_unmute()
+                    _was_muted = is_muted
+
                     try:
                         chunk = q.get(timeout=0.1)
+                        with self._speaking_lock:
+                            if self._speaking:
+                                continue
+
                         text, is_final = self._stt.process_chunk(chunk.tobytes())
-                        if is_final and text.strip():
-                            self._process_message(text)
+                        if is_final:
+                            if text.strip():
+                                self._process_message(text)
+                            else:
+                                self.ui.set_state("LISTENING")
                     except queue.Empty:
                         pass
         except Exception as e:
@@ -1212,17 +1389,24 @@ class JarvisLocal:
         try:
             self.ui.on_reconfigure = self.reconfigure
 
-            # ── Ollama ────────────────────────────────────────────────────
-            from core.llm_client import ensure_ollama_running, warmup_model, check_model_available
-            self.ui.write_log("SYS: Checking Ollama…")
+            # ── LLM Service Check ─────────────────────────────────────────
+            from core.llm_client import ensure_ollama_running, check_model_available, _load_config
+            raw_prov = _load_config().get("llm_provider", "ollama").strip().lower()
+            provider_lbl = {
+                "ollama": "Ollama",
+                "openai": "OpenAI",
+                "silab": "SI-Lab",
+            }.get(raw_prov, "LLM Service")
+            self.ui.write_log(f"SYS: Checking {provider_lbl}…")
             if ensure_ollama_running():
-                self.ui.write_log("SYS: Ollama OK.")
+                self.ui.write_log(f"SYS: {provider_lbl} OK.")
                 check_model_available(log=self.ui.write_log)
             else:
-                self.ui.write_log("ERR: Ollama unavailable — run: ollama serve")
+                self.ui.write_log(f"ERR: {provider_lbl} unavailable.")
 
             # ── Config ────────────────────────────────────────────────────
             stt_engine   = self._config.get("stt_engine",   "whisper").lower()
+            self._stt_engine_name = stt_engine.upper()
             stt_language = self._config.get("stt_language", "auto")
             stt_model    = self._config.get("stt_model",    "base")
             tts_engine   = self._config.get("tts_engine",   "edgetts").lower()
@@ -1241,6 +1425,7 @@ class JarvisLocal:
                     # static prefix → Ollama reuses cached KV → first token <1 s
                     # instead of the ~17 s it takes to re-evaluate 300+ tokens cold.
                     static_prompt = _load_system_prompt()
+                    from core.llm_client import warmup_model
                     ok = warmup_model(system_prompt=static_prompt)
                     if ok:
                         self.ui.write_log("SYS: LLM ready.")
@@ -1281,6 +1466,18 @@ class JarvisLocal:
                             self._config.get("vosk_model_path"),
                             language=stt_language,
                         )
+                    elif stt_engine == "wav2vec":
+                        import os
+                        from core.stt import Wav2Vec2STT
+                        self._stt = Wav2Vec2STT(
+                            model_path=self._config.get("stt_model", "Ziidsbox/wav2vec2-indonesian-melayu-riau"),
+                            hf_token=os.getenv("HF_TOKEN"),
+                        )
+                    elif stt_engine == "remote":
+                        from core.stt import RemoteSTT
+                        self._stt = RemoteSTT(
+                            api_url=self._config.get("stt_url", "http://localhost:8000/transcribe")
+                        )
                     else:
                         from core.stt import WhisperSTT
                         self._stt = WhisperSTT(stt_model, language=stt_language)
@@ -1305,7 +1502,7 @@ class JarvisLocal:
                     self.ui.mark_startup_ready("tts")
                     self.ui.set_startup_status("● All systems ready.")
                     self.ui.hide_startup_panel()
-                    self.speak("Jarvis fully online.")
+                    self.speak("Jarvis siap digunakan.")
                 except Exception as e:
                     import traceback as _tb; _tb.print_exc()
                     self.ui.write_log(f"ERR: TTS — {e}")
@@ -1322,18 +1519,49 @@ class JarvisLocal:
             _warmup_done.wait(timeout=60)
             _stt_done.wait(timeout=60)
 
+            # ── Push To Talk (PTT) ────────────────────────────────────────
+            try:
+                import pynput
+                def _on_press(key):
+                    if key == pynput.keyboard.Key.space:
+                        if self.ui.muted:
+                            self._ptt_active = True
+                            self.ui.muted = False
+                def _on_release(key):
+                    if key == pynput.keyboard.Key.space:
+                        if getattr(self, "_ptt_active", False):
+                            self._ptt_active = False
+                            self.ui.muted = True
+                
+                self._ptt_active = False
+                ptt_listener = pynput.keyboard.Listener(on_press=_on_press, on_release=_on_release)
+                ptt_listener.daemon = True
+                ptt_listener.start()
+                self.ui.write_log("SYS: Push-To-Talk (PTT) active. Hold SPACE to speak.")
+            except ImportError:
+                self.ui.write_log("WRN: pynput not installed. PTT disabled.")
+
             # ── Go online immediately ──────────────────────────────────────
             self.ui.write_log("SYS: JARVIS online.")
-            self.ui.set_state("LISTENING")
+            if not getattr(self.ui, "muted", False):
+                self.ui.set_state("LISTENING")
+            else:
+                self.ui.set_state("MUTED")
             self.ui.set_startup_status("● JARVIS online · Voice loading in background…")
 
             threading.Thread(target=self._tts_worker,        daemon=True).start()
             threading.Thread(target=self._text_command_loop,  daemon=True).start()
 
             # STT loop — blocks this thread forever
-            if stt_engine == "vosk":
+            if self._stt is None:
+                self.ui.write_log(
+                    "ERR: STT engine failed to load — voice input disabled.\n"
+                    "     Use the text input box or reconfigure STT in settings."
+                )
+            elif stt_engine == "vosk":
                 self._listen_vosk()
             else:
+                # Wav2Vec uses the same VAD → transcribe() pipeline as Whisper
                 self._listen_whisper()
 
         except Exception as e:

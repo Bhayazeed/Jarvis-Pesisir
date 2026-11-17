@@ -249,7 +249,7 @@ class HudCanvas(QWidget):
         self.setMinimumSize(300, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.muted    = False
+        self.muted    = True
         self.speaking = False
         self.state    = "INITIALISING"
 
@@ -462,11 +462,9 @@ class HudCanvas(QWidget):
             p.setBrush(QBrush(qcol(C.PRI, a)))
             p.drawEllipse(QPointF(pt[0], pt[1]), 2.5, 2.5)
 
-        # status text
+        # status text — active states (THINKING/SPEAKING) take priority over MUTED
         sy = cy + fw * 0.40
-        if self.muted:
-            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
-        elif self.speaking:
+        if self.speaking:
             txt, col = "●  SPEAKING",  qcol(C.ACC)
         elif self.state == "THINKING":
             sym = "◈" if self._blink else "◇"
@@ -474,6 +472,8 @@ class HudCanvas(QWidget):
         elif self.state == "PROCESSING":
             sym = "▷" if self._blink else "▶"
             txt, col = f"{sym}  PROCESSING", qcol(C.ACC2)
+        elif self.muted:
+            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
@@ -855,6 +855,326 @@ class _DropCanvas(QWidget):
             z.mousePressEvent(e)
 
 
+_DEMO_AUDIO_EXTS = {"wav", "mp3", "ogg", "flac", "m4a", "aac", "opus", "wma"}
+
+
+class DemoAudioZone(QWidget):
+    """Drop zone specifically for demo voice/audio files."""
+    demo_audio_selected = pyqtSignal(str)   # file path
+    demo_process_requested = pyqtSignal(str)  # file path — user clicked ▶
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(108)
+        self._current_file: str | None = None
+        self._hovering   = False
+        self._drag_over  = False
+        self._processing = False
+        self._dash_offset = 0.0
+        self._anim_tmr = QTimer(self)
+        self._anim_tmr.timeout.connect(self._animate)
+        self._anim_tmr.start(40)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._canvas = _DemoDropCanvas(self)
+        layout.addWidget(self._canvas)
+
+    # ── animation ──────────────────────────────────────────────────────
+    def _animate(self):
+        self._dash_offset = (self._dash_offset + 0.8) % 20
+        self._canvas.update()
+
+    # ── drag and drop ──────────────────────────────────────────────────
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            url = e.mimeData().urls()[0].toLocalFile()
+            ext = Path(url).suffix.lower().lstrip(".")
+            if ext in _DEMO_AUDIO_EXTS:
+                e.acceptProposedAction()
+                self._drag_over = True
+                self._canvas.update()
+                return
+        e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._drag_over = False; self._canvas.update()
+
+    def dropEvent(self, e: QDropEvent):
+        self._drag_over = False
+        urls = e.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            p = Path(path)
+            if p.is_file() and p.suffix.lower().lstrip(".") in _DEMO_AUDIO_EXTS:
+                self._set_file(path)
+        self._canvas.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            # Delegate click handling to the canvas (it detects ✕ and ▶ zones)
+            self._canvas._handle_click(e.pos())
+
+    def enterEvent(self, e):
+        self._hovering = True; self._canvas.update()
+
+    def leaveEvent(self, e):
+        self._hovering = False; self._canvas.update()
+
+    # ── public API ─────────────────────────────────────────────────────
+    def current_file(self) -> str | None:
+        return self._current_file
+
+    def clear_file(self):
+        self._current_file = None
+        self._processing = False
+        self._canvas.update()
+
+    def set_processing(self, v: bool):
+        self._processing = v
+        self._canvas.update()
+
+    # ── internal ───────────────────────────────────────────────────────
+    def _browse(self):
+        exts = " ".join(f"*.{e}" for e in sorted(_DEMO_AUDIO_EXTS))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select audio file for DEMO", str(Path.home()),
+            f"Audio Files ({exts})",
+        )
+        if path:
+            self._set_file(path)
+
+    def _set_file(self, path: str):
+        self._current_file = path
+        self._processing = False
+        self._canvas.update()
+        self.demo_audio_selected.emit(path)
+
+    def _request_process(self):
+        if self._current_file and not self._processing:
+            self._processing = True
+            self._canvas.update()
+            self.demo_process_requested.emit(self._current_file)
+
+    def _preview_audio(self):
+        if self._current_file:
+            def _play():
+                try:
+                    from core.tts import load_audio_file, _play_np
+                    # Load audio (handles M4A/AAC via ffmpeg, resamples to 24kHz)
+                    audio_data = load_audio_file(self._current_file, target_sr=24000)
+                    _play_np(audio_data, 24000)
+                except Exception as e:
+                    print(f"[DemoAudioZone] Preview failed: {e}")
+            import threading
+            threading.Thread(target=_play, daemon=True).start()
+
+
+class _DemoDropCanvas(QWidget):
+    """Custom-painted canvas for DemoAudioZone."""
+
+    def __init__(self, zone: DemoAudioZone):
+        super().__init__(zone)
+        self._z = zone
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        z    = self._z
+        W, H = self.width(), self.height()
+        pad  = 6
+        rect = QRectF(pad, pad, W - pad * 2, H - pad * 2)
+
+        # ── background ─────────────────────────────────────────────────
+        if z._processing:
+            bg_col = qcol("#1a0800")
+        elif z._drag_over:
+            bg_col = qcol("#1a1000")
+        elif z._hovering:
+            bg_col = qcol("#0d0a00")
+        else:
+            bg_col = qcol(C.PANEL)
+        p.setBrush(QBrush(bg_col)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(rect, 6, 6)
+
+        # ── border ─────────────────────────────────────────────────────
+        if z._processing:
+            border_col = qcol(C.ACC, 230)
+        elif z._current_file:
+            border_col = qcol(C.ACC2, 200)
+        elif z._drag_over:
+            border_col = qcol(C.ACC, 230)
+        elif z._hovering:
+            border_col = qcol(C.BORDER_B, 200)
+        else:
+            border_col = qcol(C.BORDER, 160)
+
+        pen = QPen(border_col, 1.5, Qt.PenStyle.DashLine)
+        pen.setDashOffset(z._dash_offset)
+        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, 6, 6)
+
+        # ── content ────────────────────────────────────────────────────
+        if z._current_file:
+            self._paint_file(p, W, H)
+        elif z._drag_over:
+            self._paint_drag_over(p, W, H)
+        else:
+            self._paint_idle(p, W, H, z._hovering)
+
+    def _paint_idle(self, p, W, H, hover):
+        cx, cy = W / 2, H / 2 - 4
+
+        # Waveform icon
+        bars = [4, 8, 14, 10, 16, 12, 6, 10, 14, 8, 4]
+        bar_w, bar_gap = 3, 2
+        total_w = len(bars) * bar_w + (len(bars) - 1) * bar_gap
+        bx = cx - total_w / 2
+        col = qcol(C.ACC if hover else "#994400")
+        for i, bh in enumerate(bars):
+            x = bx + i * (bar_w + bar_gap)
+            p.fillRect(QRectF(x, cy - bh / 2, bar_w, bh), col)
+
+        p.setFont(QFont("Courier New", 8))
+        p.setPen(QPen(qcol(C.ACC if hover else C.TEXT_DIM), 1))
+        p.drawText(QRectF(0, cy + 14, W, 16), Qt.AlignmentFlag.AlignCenter,
+                   "Drop audio here  or  Click to Browse")
+        p.setFont(QFont("Courier New", 7))
+        p.setPen(QPen(qcol("#4a3a1a"), 1))
+        p.drawText(QRectF(0, cy + 30, W, 14), Qt.AlignmentFlag.AlignCenter,
+                   "WAV · MP3 · OGG · FLAC · M4A · AAC")
+
+    def _paint_drag_over(self, p, W, H):
+        cx, cy = W / 2, H / 2
+        p.setFont(QFont("Courier New", 20))
+        p.setPen(QPen(qcol(C.ACC), 1))
+        p.drawText(QRectF(0, cy - 24, W, 32), Qt.AlignmentFlag.AlignCenter, "🎤")
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.ACC), 1))
+        p.drawText(QRectF(0, cy + 12, W, 16), Qt.AlignmentFlag.AlignCenter,
+                   "Release to load audio")
+
+    def _paint_file(self, p, W, H):
+        z    = self._z
+        path = Path(z._current_file)
+        ext_str  = path.suffix.upper().lstrip(".") or "AUDIO"
+        try:
+            size_str = _fmt_size(path.stat().st_size)
+        except OSError:
+            size_str = "??"
+
+        # ── Left: audio icon ──────────────────────────────────────────
+        block_x, block_w = 10, 48
+        p.setFont(QFont("Segoe UI Emoji", 20) if _OS == "Windows" else QFont("Arial", 20))
+        p.setPen(QPen(qcol("#cc44ff"), 1))
+        p.drawText(QRectF(block_x, 0, block_w, H), Qt.AlignmentFlag.AlignCenter, "🎵")
+
+        # ── Middle: file info ─────────────────────────────────────────
+        tx = block_x + block_w + 6
+        tw = W - tx - 80  # leave room for buttons
+
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.WHITE), 1))
+        name = path.name if len(path.name) <= 26 else path.name[:23] + "..."
+        p.drawText(QRectF(tx, H * 0.2, tw, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+
+        p.setFont(QFont("Courier New", 7))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(tx, H * 0.2 + 18, tw, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"{ext_str}  ·  {size_str}")
+
+        if z._processing:
+            p.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            p.setPen(QPen(qcol(C.ACC), 1))
+            p.drawText(QRectF(tx, H * 0.2 + 34, tw, 14),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       "⟳  Processing…")
+        else:
+            p.setFont(QFont("Courier New", 6))
+            p.setPen(QPen(qcol("#1e5c6a"), 1))
+            par = str(path.parent)
+            if len(par) > 30:
+                par = "…" + par[-29:]
+            p.drawText(QRectF(tx, H * 0.2 + 34, tw, 12),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, par)
+
+        # ── Right side buttons ────────────────────────────────────────
+        btn_w, btn_h = 32, 28
+        btn_x = W - btn_w - 12
+        gap = 4
+
+        start_y = (H - (3 * btn_h + 2 * gap)) / 2
+
+        # 🔊 PREVIEW button
+        prev_y = start_y
+        prev_rect = QRectF(btn_x, prev_y, btn_w, btn_h)
+        p.setBrush(QBrush(qcol("#001a2a")))
+        p.setPen(QPen(qcol(C.PRI, 180), 1))
+        p.drawRoundedRect(prev_rect, 4, 4)
+        p.setFont(QFont("Segoe UI Emoji", 12) if _OS == "Windows" else QFont("Arial", 12))
+        p.setPen(QPen(qcol(C.PRI, 200), 1))
+        p.drawText(prev_rect, Qt.AlignmentFlag.AlignCenter, "🔊")
+
+        # ▶ PROCESS button
+        proc_y = start_y + btn_h + gap
+        proc_rect = QRectF(btn_x, proc_y, btn_w, btn_h)
+        if z._processing:
+            p.setBrush(QBrush(qcol("#331a00")))
+            p.setPen(QPen(qcol(C.ACC, 120), 1))
+        else:
+            p.setBrush(QBrush(qcol("#002a0e")))
+            p.setPen(QPen(qcol(C.GREEN, 180), 1))
+        p.drawRoundedRect(proc_rect, 4, 4)
+        p.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.ACC if z._processing else C.GREEN, 200 if not z._processing else 100), 1))
+        p.drawText(proc_rect, Qt.AlignmentFlag.AlignCenter, "▶")
+
+        # ✕ CLEAR button
+        clear_y = start_y + 2 * (btn_h + gap)
+        clear_rect = QRectF(btn_x, clear_y, btn_w, btn_h)
+        p.setBrush(QBrush(qcol("#140006")))
+        p.setPen(QPen(qcol(C.RED, 120), 1))
+        p.drawRoundedRect(clear_rect, 4, 4)
+        p.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.RED, 180), 1))
+        p.drawText(clear_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+
+    def _handle_click(self, pos):
+        z = self._z
+        W, H = self.width(), self.height()
+        btn_w, btn_h = 32, 28
+        btn_x = W - btn_w - 12
+        gap = 4
+
+        if z._current_file:
+            start_y = (H - (3 * btn_h + 2 * gap)) / 2
+
+            # Check 🔊 button
+            prev_y = start_y
+            if btn_x <= pos.x() <= btn_x + btn_w and prev_y <= pos.y() <= prev_y + btn_h:
+                z._preview_audio()
+                return
+
+            # Check ▶ button
+            proc_y = start_y + btn_h + gap
+            if btn_x <= pos.x() <= btn_x + btn_w and proc_y <= pos.y() <= proc_y + btn_h:
+                z._request_process()
+                return
+
+            # Check ✕ button
+            clear_y = start_y + 2 * (btn_h + gap)
+            if btn_x <= pos.x() <= btn_x + btn_w and clear_y <= pos.y() <= clear_y + btn_h:
+                z.clear_file()
+                return
+        # Default: browse
+        z._browse()
+
+
 class SetupOverlay(QWidget):
     # Emits a JSON string containing the full config dict
     done = pyqtSignal(str)
@@ -961,7 +1281,7 @@ class SetupOverlay(QWidget):
         layout.addWidget(_lbl("SPEECH-TO-TEXT ENGINE", 7, col=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
         stt_row, self._stt_btns = _toggle_row(
-            [("whisper","🎙 Whisper"), ("vosk","🔊 Vosk")],
+            [("whisper","🎙 Whisper"), ("vosk","🔊 Vosk"), ("wav2vec","🧠 Wav2Vec")],
             lambda: self._sel_stt,
             self._set_stt,
         )
@@ -1003,11 +1323,18 @@ class SetupOverlay(QWidget):
         self._vosk_model_input.setText(_init.get("vosk_model_path", ""))
         stt_detail.addWidget(self._vosk_model_input)
 
+        # Wav2Vec: HF repo ID input
+        self._wav2vec_model_input = _input("HF repo ID  (e.g. Ziidsbox/wav2vec2-indonesian-melayu-riau)")
+        _wav2vec_default = _init.get("stt_model", "Ziidsbox/wav2vec2-indonesian-melayu-riau") if _init.get("stt_engine") == "wav2vec" else "Ziidsbox/wav2vec2-indonesian-melayu-riau"
+        self._wav2vec_model_input.setText(_wav2vec_default)
+        stt_detail.addWidget(self._wav2vec_model_input)
+
         layout.addLayout(stt_detail)
 
         # Initial visibility
         self._whisper_combo.setVisible(self._sel_stt == "whisper")
         self._vosk_model_input.setVisible(self._sel_stt == "vosk")
+        self._wav2vec_model_input.setVisible(self._sel_stt == "wav2vec")
 
         stt_lang_row = QHBoxLayout(); stt_lang_row.setSpacing(5)
         stt_lang_row.addWidget(_lbl("Language:", 7, col=C.TEXT_MED,
@@ -1022,11 +1349,12 @@ class SetupOverlay(QWidget):
         layout.addWidget(_lbl("LOCAL LLM", 7, col=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
 
-        # Provider toggle: Ollama vs LM Studio / OpenAI-compatible
+        # Provider toggle: Ollama vs LM Studio / OpenAI-compatible vs SI-Lab
         llm_prov_row, self._llm_prov_btns = _toggle_row(
             [
                 ("ollama", "🦙 Ollama"),
-                ("openai", "🔌 LM Studio / OpenAI"),
+                ("openai", "🔌 OpenAI / Compatible"),
+                ("silab", "🔬 SI-Lab"),
             ],
             lambda: self._sel_llm_provider,
             self._set_llm_provider,
@@ -1036,8 +1364,10 @@ class SetupOverlay(QWidget):
         # Hint label — changes based on provider
         _ollama_hint = "ollama.com  ·  run: ollama pull qwen2.5:3b"
         _openai_hint = "lmstudio.ai  ·  start Local Server first, then pick model"
+        _silab_hint = "llms.si-lab.org  ·  SI-Lab LLM API service"
         self._llm_hint_lbl = _lbl(
-            _openai_hint if self._sel_llm_provider == "openai" else _ollama_hint,
+            _openai_hint if self._sel_llm_provider == "openai"
+            else (_silab_hint if self._sel_llm_provider == "silab" else _ollama_hint),
             7, col=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft
         )
         layout.addWidget(self._llm_hint_lbl)
@@ -1047,10 +1377,12 @@ class SetupOverlay(QWidget):
                                 align=Qt.AlignmentFlag.AlignRight))
         _default_url = _init.get("llm_url",
                                   "http://localhost:1234" if self._sel_llm_provider == "openai"
-                                  else "http://localhost:11434")
+                                  else ("https://llms.si-lab.org/api" if self._sel_llm_provider == "silab"
+                                        else "http://localhost:11434"))
         self._llm_url_input = _input(
             "http://localhost:1234" if self._sel_llm_provider == "openai"
-            else "http://localhost:11434"
+            else ("https://llms.si-lab.org/api" if self._sel_llm_provider == "silab"
+                  else "http://localhost:11434")
         )
         self._llm_url_input.setText(_default_url)
         llm_row.addWidget(self._llm_url_input, stretch=2)
@@ -1060,6 +1392,22 @@ class SetupOverlay(QWidget):
         self._llm_model_input.setText(_init.get("llm_model", ""))
         llm_row.addWidget(self._llm_model_input, stretch=2)
         layout.addLayout(llm_row)
+
+        # LLM API key — only visible when OpenAI/Compatible or SI-Lab is selected
+        self._llm_key_widget = QWidget()
+        self._llm_key_widget.setStyleSheet("background: transparent;")
+        llm_key_layout = QHBoxLayout(self._llm_key_widget)
+        llm_key_layout.setContentsMargins(0, 0, 0, 0)
+        llm_key_layout.setSpacing(5)
+        llm_key_layout.addWidget(_lbl("API Key:", 7, col=C.TEXT_MED,
+                                      align=Qt.AlignmentFlag.AlignRight))
+        self._llm_key_input = _input("LLM API key (optional)", pw=True)
+        _default_key = _init.get("llm_api_key", os.getenv("SILAB_KEY", os.getenv("SILAB_API_KEY", os.getenv("OPENAI_API_KEY", ""))))
+        self._llm_key_input.setText(_default_key)
+        llm_key_layout.addWidget(self._llm_key_input)
+        layout.addWidget(self._llm_key_widget)
+        self._llm_key_widget.setVisible(self._sel_llm_provider in ("openai", "silab"))
+
         layout.addWidget(_sep())
 
         # ── TTS ──────────────────────────────────────────────────────── #
@@ -1248,20 +1596,29 @@ class SetupOverlay(QWidget):
         if hasattr(self, "_llm_url_input"):
             if key == "openai":
                 self._llm_url_input.setPlaceholderText("http://localhost:1234")
-                # Only override if it still looks like an Ollama default URL
+                # Only override if it still looks like an Ollama or SI-Lab default URL
                 cur = self._llm_url_input.text().strip()
-                if not cur or cur == "http://localhost:11434":
+                if not cur or cur in ("http://localhost:11434", "https://llms.si-lab.org/api"):
                     self._llm_url_input.setText("http://localhost:1234")
+            elif key == "silab":
+                self._llm_url_input.setPlaceholderText("https://llms.si-lab.org/api")
+                cur = self._llm_url_input.text().strip()
+                if not cur or cur in ("http://localhost:11434", "http://localhost:1234"):
+                    self._llm_url_input.setText("https://llms.si-lab.org/api")
             else:
                 self._llm_url_input.setPlaceholderText("http://localhost:11434")
                 cur = self._llm_url_input.text().strip()
-                if not cur or cur == "http://localhost:1234":
+                if not cur or cur in ("http://localhost:1234", "https://llms.si-lab.org/api"):
                     self._llm_url_input.setText("http://localhost:11434")
         if hasattr(self, "_llm_hint_lbl"):
             if key == "openai":
                 self._llm_hint_lbl.setText("lmstudio.ai  ·  start Local Server first, then pick model")
+            elif key == "silab":
+                self._llm_hint_lbl.setText("llms.si-lab.org  ·  SI-Lab LLM API service")
             else:
                 self._llm_hint_lbl.setText("ollama.com  ·  run: ollama pull qwen2.5:3b")
+        if hasattr(self, "_llm_key_widget"):
+            self._llm_key_widget.setVisible(key in ("openai", "silab"))
 
     def _set_stt(self, key: str):
         self._sel_stt = key
@@ -1283,6 +1640,8 @@ class SetupOverlay(QWidget):
             self._whisper_combo.setVisible(key == "whisper")
         if hasattr(self, "_vosk_model_input"):
             self._vosk_model_input.setVisible(key == "vosk")
+        if hasattr(self, "_wav2vec_model_input"):
+            self._wav2vec_model_input.setVisible(key == "wav2vec")
 
     def _set_tts(self, key: str):
         self._sel_tts = key
@@ -1310,9 +1669,11 @@ class SetupOverlay(QWidget):
             )
             return
 
-        # STT model: combo for Whisper, text input for Vosk
+        # STT model: combo for Whisper, text input for Vosk/Wav2Vec
         if self._sel_stt == "whisper":
             stt_model = self._whisper_combo.currentText()
+        elif self._sel_stt == "wav2vec":
+            stt_model = self._wav2vec_model_input.text().strip() or "Ziidsbox/wav2vec2-indonesian-melayu-riau"
         else:
             stt_model = self._vosk_model_input.text().strip()
 
@@ -1325,7 +1686,7 @@ class SetupOverlay(QWidget):
             tts_speed = "1.0"
 
         _provider = getattr(self, "_sel_llm_provider", "ollama")
-        _default_url = "http://localhost:1234" if _provider == "openai" else "http://localhost:11434"
+        _default_url = "http://localhost:1234" if _provider == "openai" else ("https://llms.si-lab.org/api" if _provider == "silab" else "http://localhost:11434")
         cfg = {
             "stt_engine":         self._sel_stt,
             "stt_model":          stt_model,
@@ -1333,6 +1694,7 @@ class SetupOverlay(QWidget):
             "llm_provider":       _provider,
             "llm_url":            self._llm_url_input.text().strip() or _default_url,
             "llm_model":          llm_model,
+            "llm_api_key":        self._llm_key_input.text().strip(),
             "tts_engine":         self._sel_tts,
             "tts_voice":          tts_voice,
             "tts_speed":          tts_speed,
@@ -1467,6 +1829,7 @@ class MainWindow(QMainWindow):
     _log_sig     = pyqtSignal(str)
     _state_sig   = pyqtSignal(str)
     _startup_sig = pyqtSignal(str, str)  # action, data — thread-safe startup panel control
+    _demo_done_sig = pyqtSignal(str)     # thread-safe: demo processing finished (status text)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1481,7 +1844,8 @@ class MainWindow(QMainWindow):
         )
 
         self.on_text_command  = None
-        self._muted           = False
+        self._on_demo_audio_cb = None
+        self._muted           = True
         self._current_file: str | None = None
 
         central = QWidget()
@@ -1524,6 +1888,7 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
         self._startup_sig.connect(self._on_startup_sig)
+        self._demo_done_sig.connect(self._on_demo_done)
 
         self._overlay: SetupOverlay | None = None
         self._startup_panel: StartupPanel | None = None
@@ -1666,7 +2031,7 @@ class MainWindow(QMainWindow):
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
-        title = QLabel("J.A.R.V.I.S")
+        title = QLabel("J.A.R.V.I.S PESISIR")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
@@ -1803,6 +2168,23 @@ class MainWindow(QMainWindow):
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
 
+        # ── DEMO VOICE INPUT section ──────────────────────────────────
+        lay.addWidget(_sec("DEMO VOICE"))
+        self._demo_zone = DemoAudioZone()
+        self._demo_zone.demo_audio_selected.connect(self._on_demo_audio_selected)
+        self._demo_zone.demo_process_requested.connect(self._on_demo_process)
+        lay.addWidget(self._demo_zone)
+
+        self._demo_hint = QLabel("Upload a voice recording to process as demo input")
+        self._demo_hint.setFont(QFont("Courier New", 7))
+        self._demo_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._demo_hint.setWordWrap(True)
+        lay.addWidget(self._demo_hint)
+
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep3)
+
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
@@ -1914,15 +2296,46 @@ class MainWindow(QMainWindow):
             )
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
+    # ── Demo voice handlers ───────────────────────────────────────────
+    def _on_demo_audio_selected(self, path: str):
+        p = Path(path)
+        try:
+            size = _fmt_size(p.stat().st_size)
+        except OSError:
+            size = "??"
+        self._demo_hint.setText(f"🎵  {p.name}  ·  {size}  ·  Click ▶ to process")
+        self._log.append_log(f"DEMO: {p.name} ({size}) loaded")
+
+    def _on_demo_process(self, path: str):
+        """User clicked ▶ — dispatch to backend via callback."""
+        p = Path(path)
+        self._demo_hint.setText(f"⟳  Processing {p.name}…")
+        self._demo_hint.setStyleSheet(f"color: {C.ACC}; background: transparent;")
+        self._log.append_log(f"DEMO: Processing {p.name}…")
+        if self._on_demo_audio_cb:
+            threading.Thread(
+                target=self._on_demo_audio_cb, args=(path,), daemon=True
+            ).start()
+
+    def _on_demo_done(self, status: str):
+        """Called (via signal) when demo processing completes."""
+        self._demo_zone.set_processing(False)
+        self._demo_hint.setText(status)
+        self._demo_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+
     def _toggle_mute(self):
         self._muted = not self._muted
         self.hud.muted = self._muted
         self._style_mute_btn()
         if self._muted:
-            self._apply_state("MUTED")
+            # Only override state if idle — don't hide THINKING/PROCESSING/SPEAKING
+            if self.hud.state in ("LISTENING", "INITIALISING"):
+                self._apply_state("MUTED")
             self._log.append_log("SYS: Microphone muted.")
         else:
-            self._apply_state("LISTENING")
+            # Go to LISTENING — also recover from stale SPEAKING state
+            if self.hud.state in ("MUTED", "LISTENING", "INITIALISING", "SPEAKING"):
+                self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
@@ -2086,11 +2499,37 @@ class JarvisUI:
     def on_reconfigure(self, cb):
         self._win._on_reconfigure_cb = cb
 
+    @property
+    def on_demo_audio(self):
+        return self._win._on_demo_audio_cb
+
+    @on_demo_audio.setter
+    def on_demo_audio(self, cb):
+        self._win._on_demo_audio_cb = cb
+
     def set_state(self, state: str):
-        self._win._state_sig.emit(state)
+        try:
+            self._win._state_sig.emit(state)
+        except RuntimeError:
+            pass
 
     def write_log(self, text: str):
-        self._win._log_sig.emit(text)
+        try:
+            self._win._log_sig.emit(text)
+        except RuntimeError:
+            pass
+
+    # ── Demo voice (thread-safe) ─────────────────────────────────────────
+    def set_demo_status(self, text: str) -> None:
+        """Update the demo hint label (thread-safe via signal)."""
+        try:
+            self._win._demo_done_sig.emit(text)
+        except RuntimeError:
+            pass
+
+    def set_demo_processing(self, v: bool) -> None:
+        """Update the demo zone processing indicator (must call from main thread)."""
+        self._win._demo_zone.set_processing(v)
 
     # ── Startup panel (all thread-safe) ──────────────────────────────────
     def show_startup_panel(self) -> None:
@@ -2113,5 +2552,7 @@ class JarvisUI:
         self.set_state("SPEAKING")
 
     def stop_speaking(self):
-        if not self.muted:
+        if self.muted:
+            self.set_state("MUTED")
+        else:
             self.set_state("LISTENING")

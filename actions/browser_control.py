@@ -526,7 +526,12 @@ class _BrowserSession:
         await self._launch()
         # If somehow page got closed, open a fresh one
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            try:
+                self._page = await self._context.new_page()
+            except Exception as e:
+                print(f"[Browser] Failed to open new page: {e}. Relaunching context...")
+                self._context = None
+                await self._launch()
             await asyncio.sleep(0.2)
         return self._page
 

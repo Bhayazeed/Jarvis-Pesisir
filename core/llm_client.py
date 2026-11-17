@@ -17,6 +17,7 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,14 +43,90 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
     "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai"
+    "llm_provider": "ollama",   # "ollama" | "openai" | "silab"
+    "llm_api_key":  "",
 }
+
+_openai_client = None
 
 
 def get_llm_provider() -> str:
     """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
-    return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
+    return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp", "silab") else "ollama"
+
+
+def get_llm_api_key() -> str:
+    cfg = _load_config()
+    key = cfg.get("llm_api_key", "").strip()
+    if not key:
+        key = os.getenv("SILAB_KEY") or os.getenv("SILAB_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    return key
+
+
+def _get_openai_client(url: str):
+    global _openai_client
+    import openai
+    
+    # Base URL parsing
+    base_url = url.rstrip('/')
+    if not (base_url.endswith("/v1") or base_url.endswith("/api")):
+        base_url = f"{base_url}/v1"
+        
+    api_key = get_llm_api_key() or "sk-no-key"
+    
+    if _openai_client is None or getattr(_openai_client, "base_url", None) != base_url or getattr(_openai_client, "api_key", None) != api_key:
+        _openai_client = openai.OpenAI(base_url=base_url, api_key=api_key)
+        
+    return _openai_client
+
+
+def _prepare_openai_messages(messages: list) -> list:
+    """
+    OpenAI API expects the 'arguments' field in function/tool_calls to be a JSON string,
+    but JARVIS's internal framework stores it as a parsed dictionary. We convert it
+    back to a JSON string here to avoid '400 Bad Request' errors.
+    """
+    clean_messages = []
+    for msg in messages:
+        new_msg = dict(msg)
+        if "tool_calls" in new_msg and new_msg["tool_calls"]:
+            new_tool_calls = []
+            for tc in new_msg["tool_calls"]:
+                new_tc = dict(tc)
+                if "type" not in new_tc:
+                    new_tc["type"] = "function"
+                if "function" in new_tc:
+                    fn = dict(new_tc["function"])
+                    if "arguments" in fn:
+                        args = fn["arguments"]
+                        if isinstance(args, (dict, list)):
+                            fn["arguments"] = json.dumps(args)
+                        elif isinstance(args, str):
+                            try:
+                                json.loads(args)
+                            except Exception:
+                                fn["arguments"] = "{}"
+                    new_tc["function"] = fn
+                new_tool_calls.append(new_tc)
+            new_msg["tool_calls"] = new_tool_calls
+        clean_messages.append(new_msg)
+    return clean_messages
+
+
+def _get_openai_health_endpoint_and_headers(url: str) -> tuple[str, dict]:
+    if url.endswith("/v1") or url.endswith("/v1/"):
+        health = f"{url.rstrip('/')}/models"
+    elif url.endswith("/api") or url.endswith("/api/"):
+        health = f"{url.rstrip('/')}/models"
+    else:
+        health = f"{url.rstrip('/')}/v1/models"
+    
+    headers = {}
+    api_key = get_llm_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return health, headers
 
 
 def _load_config() -> dict:
@@ -71,9 +148,9 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
     if provider == "openai":
         # OpenAI-compatible servers (LM Studio, LocalAI, etc.) must be started
         # by the user — we just check if they're reachable.
-        health = f"{url}/v1/models"
+        health, headers = _get_openai_health_endpoint_and_headers(url)
         try:
-            ok = requests.get(health, timeout=5).status_code == 200
+            ok = requests.get(health, headers=headers, timeout=5).status_code == 200
             if ok:
                 print(f"[LLM] OpenAI-compatible server reachable at {url}")
             else:
@@ -149,15 +226,15 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     if provider == "openai":
         # OpenAI-compatible: just fire a minimal request to ensure the model is loaded.
         # No keep_alive or KV-cache priming available — server manages this internally.
-        payload = {
-            "model":      model,
-            "messages":   messages,
-            "stream":     False,
-            "max_tokens": 1,
-        }
+        client = _get_openai_client(url)
         try:
-            resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
-            resp.raise_for_status()
+            client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False,
+                max_tokens=1,
+                temperature=0.0,
+            )
             print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
             return True
         except Exception as e:
@@ -241,39 +318,38 @@ def call_llm(
     provider   = get_llm_provider()
 
     if provider == "openai":
-        endpoint = f"{url}/v1/chat/completions"
-        payload: dict = {
+        client = _get_openai_client(url)
+        kwargs = {
             "model":      model,
-            "messages":   messages,
+            "messages":   _prepare_openai_messages(messages),
             "stream":     False,
             "max_tokens": 150,
+            "temperature": 0.0,
         }
         if tools:
-            payload["tools"]       = tools
-            payload["tool_choice"] = "auto"
+            kwargs["tools"]       = tools
+            kwargs["tool_choice"] = "auto"
         try:
-            resp = requests.post(endpoint, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            choice = resp.json().get("choices", [{}])[0]
-            msg    = choice.get("message", {})
-            # OpenAI tool_calls format → normalise to Ollama-style
-            raw_tc  = msg.get("tool_calls") or []
-            tc_list = [
-                {
-                    "id":       t.get("id", ""),
+            resp = client.chat.completions.create(**kwargs)
+            choice = resp.choices[0]
+            msg    = choice.message
+            
+            raw_tc  = getattr(msg, "tool_calls", None) or []
+            tc_list = []
+            for t in raw_tc:
+                try:
+                    args = json.loads(t.function.arguments)
+                except Exception:
+                    args = t.function.arguments
+                tc_list.append({
+                    "id":       getattr(t, "id", None) or f"call_{len(tc_list)}",
                     "function": {
-                        "name":      t["function"]["name"],
-                        "arguments": (
-                            json.loads(t["function"]["arguments"])
-                            if isinstance(t["function"].get("arguments"), str)
-                            else t["function"].get("arguments", {})
-                        ),
+                        "name":      t.function.name,
+                        "arguments": args,
                     },
-                }
-                for t in raw_tc
-            ]
+                })
             return {
-                "content":    (msg.get("content") or "").strip(),
+                "content":    (getattr(msg, "content", None) or "").strip(),
                 "tool_calls": tc_list,
             }
         except Exception as e:
@@ -329,7 +405,7 @@ def call_llm(
 
 
 def call_llm_text(
-    prompt:  str,
+    prompt:  str | list,
     system:  str | None = None,
     model:   str | None = None,
     timeout: int = 120,
@@ -339,14 +415,59 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
+    provider = get_llm_provider()
     m        = model or default_model
 
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    
+    if isinstance(prompt, list):
+        import base64
+        import io
+        text_part = ""
+        b64_img = ""
+        for item in prompt:
+            if isinstance(item, str):
+                text_part += item + "\n"
+            else:
+                buf = io.BytesIO()
+                item.convert("RGB").save(buf, format="JPEG")
+                b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
+        
+        if provider == "openai":
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text_part.strip()},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": text_part.strip(),
+                "images": [b64_img]
+            })
+    else:
+        messages.append({"role": "user", "content": prompt})
 
+    if provider == "openai":
+        client = _get_openai_client(url)
+        try:
+            resp = client.chat.completions.create(
+                model=m,
+                messages=messages,
+                stream=False,
+                max_tokens=600,
+                temperature=0.0,
+            )
+            return (getattr(resp.choices[0].message, "content", None) or "").strip()
+        except Exception as e:
+            raise RuntimeError(f"OpenAI-compatible LLM text call failed: {e}")
+
+    # ── Ollama ──────────────────────────────────────────────────────────────
+    endpoint = f"{url}/api/chat"
     payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
 
     try:
@@ -381,106 +502,106 @@ def _stream_openai(
     so the output format is identical to the Ollama backend.
     """
     url, model = get_llm_settings()
-    endpoint   = f"{url}/v1/chat/completions"
+    client = _get_openai_client(url)
 
-    payload: dict = {
+    kwargs = {
         "model":      model,
-        "messages":   messages,
+        "messages":   _prepare_openai_messages(messages),
         "stream":     True,
         "max_tokens": 150,
+        "temperature": 0.0,
     }
     if tools:
-        payload["tools"]       = tools
-        payload["tool_choice"] = "auto"
+        kwargs["tools"]       = tools
+        kwargs["tool_choice"] = "auto"
 
     try:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
-            resp.raise_for_status()
-            full_content = ""
-            buf          = ""
-            # tool_call fragments: index → {"id", "function": {"name", "arguments"}}
-            tc_fragments: dict[int, dict] = {}
+        resp = client.chat.completions.create(**kwargs)
+        full_content = ""
+        buf          = ""
+        tc_fragments: dict[int, dict] = {}
+        index_map: dict[int, int] = {}
+        next_internal_idx = 0
 
-            for raw in resp.iter_lines():
-                if not raw:
-                    continue
-                # SSE lines look like: b"data: {...}" or b"data: [DONE]"
-                line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
+        for chunk in resp:
+            if not getattr(chunk, "choices", None):
+                continue
+            choice = chunk.choices[0]
+            delta  = getattr(choice, "delta", None)
+            if not delta:
+                continue
+
+            text   = getattr(delta, "content", None) or ""
+            full_content += text
+            buf          += text
+
+            # Accumulate sentence boundaries for streaming TTS
+            while True:
+                m = _SENT_END.search(buf)
+                if not m:
                     break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+                sentence = buf[: m.start() + 1].strip()
+                buf      = buf[m.end():]
+                if sentence:
+                    yield {"type": "sentence", "text": sentence}
 
-                choice = chunk.get("choices", [{}])[0]
-                delta  = choice.get("delta", {})
-                text   = delta.get("content") or ""
+            # Accumulate streaming tool-call fragments
+            if getattr(delta, "tool_calls", None):
+                for tc in delta.tool_calls:
+                    server_idx = getattr(tc, "index", 0)
+                    tc_id      = getattr(tc, "id", None)
 
-                full_content += text
-                buf          += text
+                    if tc_id:
+                        # New tool call
+                        internal_idx = next_internal_idx
+                        next_internal_idx += 1
+                        index_map[server_idx] = internal_idx
+                        tc_fragments[internal_idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                    else:
+                        if server_idx not in index_map:
+                            internal_idx = next_internal_idx
+                            next_internal_idx += 1
+                            index_map[server_idx] = internal_idx
+                            tc_fragments[internal_idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                        else:
+                            internal_idx = index_map[server_idx]
 
-                # Accumulate sentence boundaries for streaming TTS
-                while True:
-                    m = _SENT_END.search(buf)
-                    if not m:
-                        break
-                    sentence = buf[: m.start() + 1].strip()
-                    buf      = buf[m.end():]
-                    if sentence:
-                        yield {"type": "sentence", "text": sentence}
+                    frag = tc_fragments[internal_idx]
+                    
+                    if getattr(tc, "id", None):
+                        frag["id"] += tc.id
+                    
+                    fn = getattr(tc, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            frag["function"]["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            frag["function"]["arguments"] += fn.arguments
 
-                # Accumulate streaming tool-call fragments
-                for tc in (delta.get("tool_calls") or []):
-                    idx = tc.get("index", 0)
-                    if idx not in tc_fragments:
-                        tc_fragments[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
-                    frag = tc_fragments[idx]
-                    frag["id"] = frag["id"] or tc.get("id", "")
-                    fn = tc.get("function", {})
-                    frag["function"]["name"]      += fn.get("name") or ""
-                    frag["function"]["arguments"] += fn.get("arguments") or ""
+        # Flush any trailing content
+        if buf.strip():
+            yield {"type": "sentence", "text": buf.strip()}
 
-                finish = choice.get("finish_reason")
-                if finish in ("stop", "tool_calls", "length"):
-                    break
+        # Parse accumulated tool-call argument strings → dicts
+        tool_calls: list = []
+        for idx in sorted(tc_fragments):
+            frag = tc_fragments[idx]
+            args_str = frag["function"]["arguments"]
+            try:
+                args = json.loads(args_str)
+            except Exception:
+                args = args_str
+            tool_calls.append({
+                "id":       frag.get("id") or f"call_{idx}",
+                "function": {"name": frag["function"]["name"], "arguments": args},
+            })
 
-            # Flush any trailing content
-            if buf.strip():
-                yield {"type": "sentence", "text": buf.strip()}
+        yield {
+            "type":       "done",
+            "content":    full_content.strip(),
+            "tool_calls": tool_calls,
+        }
 
-            # Parse accumulated tool-call argument strings → dicts
-            tool_calls: list = []
-            for idx in sorted(tc_fragments):
-                frag = tc_fragments[idx]
-                args = frag["function"]["arguments"]
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass   # leave as raw string; _execute_tool handles it
-                tool_calls.append({
-                    "id":       frag["id"],
-                    "function": {"name": frag["function"]["name"], "arguments": args},
-                })
-
-            yield {
-                "type":       "done",
-                "content":    full_content.strip(),
-                "tool_calls": tool_calls,
-            }
-
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            f"Cannot reach OpenAI-compatible server at {url}.\n"
-            "Make sure LM Studio / LocalAI / Jan is running and the server is started."
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("OpenAI-compatible stream timed out.")
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
     except Exception as e:
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 

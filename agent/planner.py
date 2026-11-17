@@ -28,6 +28,7 @@ ABSOLUTE RULES:
 - Use web_search for ANY information retrieval, research, or current data.
 - Use file_controller to save content to disk.
 - Max 5 steps. Use the minimum steps needed.
+- If the goal is in Malay/Indonesian, map it to the English tool parameters correctly.
 
 AVAILABLE TOOLS AND THEIR PARAMETERS:
 

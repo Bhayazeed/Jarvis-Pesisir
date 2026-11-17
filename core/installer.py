@@ -19,7 +19,8 @@ _CORE: list[tuple[str, str]] = [
     ("psutil",             "psutil"),
     ("PIL",                "pillow"),
     ("sounddevice",        "sounddevice"),
-    ("numpy",              "numpy"),
+    ("numpy",              "numpy<2"),
+    ("scipy",              "scipy<1.13"),
     ("requests",           "requests"),
     ("bs4",                "beautifulsoup4"),
     ("duckduckgo_search",  "duckduckgo-search"),
@@ -33,6 +34,8 @@ _CORE: list[tuple[str, str]] = [
     ("send2trash",         "send2trash"),
     ("pptx",               "python-pptx"),
     ("youtube_transcript_api", "youtube-transcript-api"),
+    ("librosa",            "librosa"),
+    ("imageio_ffmpeg",     "imageio-ffmpeg"),
 ]
 
 # Windows-only (pywinauto, pycaw, win10toast, comtypes)
@@ -47,6 +50,11 @@ _WINDOWS: list[tuple[str, str]] = [
 _STT: dict[str, list[tuple[str, str]]] = {
     "whisper": [("faster_whisper", "faster-whisper")],
     "vosk":    [("vosk",           "vosk")],
+    "wav2vec": [
+        ("torch",        "torch==2.4.0"),
+        ("torchaudio",   "torchaudio==2.4.0"),
+        ("transformers", "transformers==4.41.2"),
+    ],
 }
 
 # TTS engine packages
