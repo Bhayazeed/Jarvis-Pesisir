@@ -1,5 +1,5 @@
-# ⚙️ MARK LVII (57)
-### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
+# JARVIS PESISIR — Coastal Riau Malay Voice Assistant
+### Fork of FatihMakes' Mark LVII, adapted for Indonesian and Coastal Riau Malay
 
 > **Modified version** of [FatihMakes/JARVIS Mark-XL](https://github.com/FatihMakes/Mark-XL)  
 > Adapted for Indonesian/Malay language support, SI-Lab LLM backend, and Wav2Vec 2.0 Melayu-Riau STT.
